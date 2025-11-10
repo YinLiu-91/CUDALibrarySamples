@@ -35,19 +35,21 @@
         x is the (dense) solution vector (or a matrix).
 */
 
-#define CUDSS_EXAMPLE_FREE \
-    do { \
-        free(csr_offsets_h); \
-        free(csr_columns_h); \
-        free(csr_values_h); \
-        free(x_values_h); \
-        free(b_values_h); \
-        cudaFree(csr_offsets_d); \
-        cudaFree(csr_columns_d); \
-        cudaFree(csr_values_d); \
-        cudaFree(x_values_d); \
-        cudaFree(b_values_d); \
-    } while(0);
+#define CUDSS_EXAMPLE_FREE                                      \
+  do {                                                          \
+    /* 释放保存在主机端的 CSR 结构、解向量和右端项等缓冲区。 */ \
+    free(csr_offsets_h);                                        \
+    free(csr_columns_h);                                        \
+    free(csr_values_h);                                         \
+    free(x_values_h);                                           \
+    free(b_values_h);                                           \
+    /* 释放 GPU 端与上述缓冲区一一对应的设备内存，避免泄漏。 */ \
+    cudaFree(csr_offsets_d);                                    \
+    cudaFree(csr_columns_d);                                    \
+    cudaFree(csr_values_d);                                     \
+    cudaFree(x_values_d);                                       \
+    cudaFree(b_values_d);                                       \
+  } while (0);
 
 #define CUDA_CALL_AND_CHECK(call, msg) \
     do { \
@@ -83,11 +85,13 @@ int main (int argc, char *argv[]) {
     int nnz = 8;
     int nrhs = 1;
 
+    /* 主机端用于保存稀疏矩阵 A 的 CSR 结构以及稠密向量的缓冲区。 */
     int *csr_offsets_h = NULL;
     int *csr_columns_h = NULL;
     cuComplex *csr_values_h = NULL;
     cuComplex *x_values_h = NULL, *b_values_h = NULL;
 
+    /* 设备端（GPU）上与主机缓冲区镜像的数据，用于实际计算。 */
     int *csr_offsets_d = NULL;
     int *csr_columns_d = NULL;
     cuComplex *csr_values_d = NULL;
@@ -110,6 +114,7 @@ int main (int argc, char *argv[]) {
 
     /* Initialize host memory for A and b */
     int i = 0;
+    /* CSR 行偏移数组标识每一行在列索引与数值数组中的范围。 */
     csr_offsets_h[i++] = 0;
     csr_offsets_h[i++] = 2;
     csr_offsets_h[i++] = 4;
@@ -118,6 +123,7 @@ int main (int argc, char *argv[]) {
     csr_offsets_h[i++] = 8;
 
     i = 0;
+    /* 非零元对应的列索引，与下面的 csr_values_h 一一对应。 */
     csr_columns_h[i++] = 0; csr_columns_h[i++] = 2;
     csr_columns_h[i++] = 1; csr_columns_h[i++] = 2;
     csr_columns_h[i++] = 2; csr_columns_h[i++] = 4;
@@ -125,6 +131,7 @@ int main (int argc, char *argv[]) {
     csr_columns_h[i++] = 4;
 
     i = 0;
+    /* 非零元的实部（存放在结构体成员 x 中），虚部稍后设置。 */
     csr_values_h[i++].x = 4.0; csr_values_h[i++].x = 1.0;
     csr_values_h[i++].x = 3.0; csr_values_h[i++].x = 2.0;
     csr_values_h[i++].x = 5.0; csr_values_h[i++].x = 1.0;
@@ -132,6 +139,7 @@ int main (int argc, char *argv[]) {
     csr_values_h[i++].x = 2.0;
 
     i = 0;
+    /* 非零元的虚部（结构体成员 y）。本示例矩阵为实矩阵，因此设为 0。 */
     csr_values_h[i++].y = 0.0; csr_values_h[i++].y = 0.0;
     csr_values_h[i++].y = 0.0; csr_values_h[i++].y = 0.0;
     csr_values_h[i++].y = 0.0; csr_values_h[i++].y = 0.0;
@@ -200,6 +208,7 @@ int main (int argc, char *argv[]) {
 
     int64_t nrows = n, ncols = n;
     int ldb = ncols, ldx = nrows;
+    /* 使用稠密矩阵描述符包裹裸指针，便于 cuDSS 统一访问。 */
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&b, ncols, nrhs, ldb, b_values_d, CUDA_C_32F,
                          CUDSS_LAYOUT_COL_MAJOR), status, "cudssMatrixCreateDn for b");
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&x, nrows, nrhs, ldx, x_values_d, CUDA_C_32F,
@@ -214,19 +223,19 @@ int main (int argc, char *argv[]) {
                          csr_columns_d, csr_values_d, CUDA_R_32I, CUDA_C_32F, mtype, mview,
                          base), status, "cudssMatrixCreateCsr");
 
-    /* Symbolic factorization */
+    /* 符号分解阶段：分析稀疏模式并准备内部数据结构。 */
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, solverConfig, solverData,
                          A, x, b), status, "cudssExecute for analysis");
 
-    /* Factorization */
+    /* 数值分解阶段：基于分析结果进行数值分解（SPD 矩阵对应 Cholesky）。 */
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_FACTORIZATION, solverConfig,
                          solverData, A, x, b), status, "cudssExecute for factor");
 
-    /* Solving */
+    /* 求解阶段：利用分解结果求解 Ax = b，写回解向量 x。 */
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_SOLVE, solverConfig, solverData,
                          A, x, b), status, "cudssExecute for solve");
 
-    /* Destroying opaque objects, matrix wrappers and the cuDSS library handle */
+    /* 按照创建的逆序销毁矩阵描述符、数据对象以及库句柄，释放内部资源。 */
     CUDSS_CALL_AND_CHECK(cudssMatrixDestroy(A), status, "cudssMatrixDestroy for A");
     CUDSS_CALL_AND_CHECK(cudssMatrixDestroy(b), status, "cudssMatrixDestroy for b");
     CUDSS_CALL_AND_CHECK(cudssMatrixDestroy(x), status, "cudssMatrixDestroy for x");
