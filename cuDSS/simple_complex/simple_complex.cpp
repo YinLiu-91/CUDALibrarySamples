@@ -81,15 +81,16 @@ int main (int argc, char *argv[]) {
     cudaError_t cuda_error = cudaSuccess;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
 
-    int n = 5;
-    int nnz = 8;
-    int nrhs = 1;
+    int n = 5;     // 问题规模
+    int nnz = 8;   // 非零元数量
+    int nrhs = 1;  // 右端项数量
 
     /* 主机端用于保存稀疏矩阵 A 的 CSR 结构以及稠密向量的缓冲区。 */
-    int *csr_offsets_h = NULL;
-    int *csr_columns_h = NULL;
-    cuComplex *csr_values_h = NULL;
-    cuComplex *x_values_h = NULL, *b_values_h = NULL;
+    int* csr_offsets_h = NULL;  // CSR 行偏移数组
+    int* csr_columns_h = NULL;  // CSR 列索引数组
+    cuComplex* csr_values_h =
+        NULL;  // CSR 非零元数组, cuComplex 类型表示float32复数
+    cuComplex *x_values_h = NULL, *b_values_h = NULL;  // 解向量和右端项
 
     /* 设备端（GPU）上与主机缓冲区镜像的数据，用于实际计算。 */
     int *csr_offsets_d = NULL;
@@ -99,7 +100,7 @@ int main (int argc, char *argv[]) {
 
     /* Allocate host memory for the sparse input matrix A,
        right-hand side x and solution b*/
-
+    /*分配主机内存*/
     csr_offsets_h = (int*)malloc((n + 1) * sizeof(int));
     csr_columns_h = (int*)malloc(nnz * sizeof(int));
     csr_values_h = (cuComplex*)malloc(nnz * sizeof(cuComplex));
@@ -163,6 +164,7 @@ int main (int argc, char *argv[]) {
     b_values_h[i++].y = 0.0;
 
     /* Allocate device memory for A, x and b */
+    /*分配设备内存*/
     CUDA_CALL_AND_CHECK(cudaMalloc(&csr_offsets_d, (n + 1) * sizeof(int)),
                         "cudaMalloc for csr_offsets");
     CUDA_CALL_AND_CHECK(cudaMalloc(&csr_columns_d, nnz * sizeof(int)),
@@ -175,6 +177,7 @@ int main (int argc, char *argv[]) {
                         "cudaMalloc for x_values");
 
     /* Copy host memory to device for A and b */
+    /*将主机内存复制到设备内存*/
     CUDA_CALL_AND_CHECK(cudaMemcpy(csr_offsets_d, csr_offsets_h, (n + 1) * sizeof(int),
                         cudaMemcpyHostToDevice), "cudaMemcpy for csr_offsets");
     CUDA_CALL_AND_CHECK(cudaMemcpy(csr_columns_d, csr_columns_h, nnz * sizeof(int),
@@ -206,7 +209,18 @@ int main (int argc, char *argv[]) {
     /* Create matrix objects for the right-hand side b and solution x (as dense matrices). */
     cudssMatrix_t x, b;
 
+    /*
+    因为解向量 x 和右端项 b 都是大小为 n×nrhs 的稠密矩阵（此例中 nrhs =
+    1），这里把矩阵的行数和列数都设置为 n（5）。使用 int64_t 是为了满足 cuDSS
+    接口对索引/尺寸使用 64 位整数的要求，以支持大规模问题。
+    */
     int64_t nrows = n, ncols = n;
+    /*
+    ldb 和 ldx 是列主序稠密矩阵的 leading
+    dimension（每列之间的内存跨度）。列主序下，一列有 nrows 个元素；而此处 nrows
+    = ncols = n，所以两者都是 n。后续创建描述符时会用到这两个步长，让 cuDSS
+    正确解释底层内存布局。
+    */
     int ldb = ncols, ldx = nrows;
     /* 使用稠密矩阵描述符包裹裸指针，便于 cuDSS 统一访问。 */
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&b, ncols, nrhs, ldb, b_values_d, CUDA_C_32F,
@@ -216,9 +230,20 @@ int main (int argc, char *argv[]) {
 
     /* Create a matrix object for the sparse input matrix. */
     cudssMatrix_t A;
-    cudssMatrixType_t mtype     = CUDSS_MTYPE_SPD;
-    cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
-    cudssIndexBase_t base       = CUDSS_BASE_ZERO;
+    cudssMatrixType_t mtype = CUDSS_MTYPE_SPD;        // 矩阵类型：对称正定
+    cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;  // 只存储上三角部分
+    cudssIndexBase_t base = CUDSS_BASE_ZERO;          // 索引从 0 开始
+
+    /*解释每个变量的含义:
+    mtype: 指定矩阵 A 的类型，这里是对称正定矩阵（SPD），
+           因为该类型矩阵可以使用更高效的 Cholesky 分解。
+    mview: 指定矩阵 A 存储的部分，这里是上三角部分，
+           因为对称矩阵的下三角部分与上三角部分是镜像关系，存储一半即可节省空间。
+    base:  指定索引的起始位置，这里是从 0 开始，符合 C/C++ 语言的习惯。
+    通过合理设置这些参数，cuDSS 能够正确理解矩阵 A 的结构和存储方式，
+    并选择合适的算法进行求解。
+
+    */
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&A, nrows, ncols, nnz, csr_offsets_d, NULL,
                          csr_columns_d, csr_values_d, CUDA_R_32I, CUDA_C_32F, mtype, mview,
                          base), status, "cudssMatrixCreateCsr");
