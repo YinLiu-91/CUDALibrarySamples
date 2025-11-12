@@ -15,13 +15,20 @@
  * limitations under the License.
  */
 
-
+#include <assert.h>
+#include <cuComplex.h>
+#include <cuda_runtime.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
-#include <assert.h>
-#include <cuda_runtime.h>
-#include <cuComplex.h>
+
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <vector>
 
 #include "cudss.h"
 
@@ -72,6 +79,385 @@
         } \
     } while(0);
 
+static inline cuComplex conjugate_if_needed(const cuComplex& value,
+                                            bool conjugate) {
+  if (!conjugate) {
+    return value;
+  }
+  return make_cuComplex(value.x, -value.y);
+}
+
+static float compute_complex_residual_norm(int n, const int* csr_offsets_h,
+                                           const int* csr_columns_h,
+                                           const cuComplex* csr_values_h,
+                                           const cuComplex* x_values_h,
+                                           const cuComplex* b_values_h,
+                                           cudssMatrixViewType_t mview,
+                                           bool isHermitian) {
+  std::vector<cuComplex> Ax(n, make_cuComplex(0.0f, 0.0f));
+
+  for (int row = 0; row < n; ++row) {
+    for (int idx = csr_offsets_h[row]; idx < csr_offsets_h[row + 1]; ++idx) {
+      int col = csr_columns_h[idx];
+      cuComplex val = csr_values_h[idx];
+
+      switch (mview) {
+        case CUDSS_MVIEW_FULL: {
+          cuComplex product = cuCmulf(val, x_values_h[col]);
+          Ax[row] = cuCaddf(Ax[row], product);
+          break;
+        }
+        case CUDSS_MVIEW_UPPER: {
+          if (col >= row) {
+            cuComplex product = cuCmulf(val, x_values_h[col]);
+            Ax[row] = cuCaddf(Ax[row], product);
+            if (col != row) {
+              cuComplex mirrored = conjugate_if_needed(val, isHermitian);
+              cuComplex mirror_product = cuCmulf(mirrored, x_values_h[row]);
+              Ax[col] = cuCaddf(Ax[col], mirror_product);
+            }
+          }
+          break;
+        }
+        case CUDSS_MVIEW_LOWER: {
+          if (col <= row) {
+            cuComplex product = cuCmulf(val, x_values_h[col]);
+            Ax[row] = cuCaddf(Ax[row], product);
+            if (col != row) {
+              cuComplex mirrored = conjugate_if_needed(val, isHermitian);
+              cuComplex mirror_product = cuCmulf(mirrored, x_values_h[row]);
+              Ax[col] = cuCaddf(Ax[col], mirror_product);
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  float norm_squared = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    cuComplex diff =
+        make_cuComplex(Ax[i].x - b_values_h[i].x, Ax[i].y - b_values_h[i].y);
+    norm_squared += diff.x * diff.x + diff.y * diff.y;
+  }
+
+  return sqrtf(norm_squared);
+}
+
+static int read_matrix_market_complex(
+    const std::string& filename, int& n, int& nnz, int** csr_offsets_h,
+    int** csr_columns_h, cuComplex** csr_values_h, cudssMatrixType_t& mtype,
+    cudssMatrixViewType_t& mview, bool& isHermitian) {
+  std::ifstream file(filename);
+  if (!file.is_open()) {
+    fprintf(stderr, "Error: Could not open matrix file %s\n", filename.c_str());
+    return EXIT_FAILURE;
+  }
+
+  std::string line;
+  bool headerFound = false;
+  bool sizeFound = false;
+  int declaredNnz = 0;
+  bool valuesAreComplex = false;
+  std::string symmetry = "general";
+
+  std::vector<std::tuple<int, int, cuComplex>> entries;
+  bool foundLower = false;
+  bool foundUpper = false;
+
+  while (std::getline(file, line)) {
+    if (line.empty()) {
+      continue;
+    }
+
+    if (!headerFound) {
+      if (line.rfind("%%MatrixMarket", 0) == 0) {
+        headerFound = true;
+        std::istringstream headerStream(line);
+        std::string marker, object, format, valueType, symmetryToken;
+        headerStream >> marker >> object >> format >> valueType >>
+            symmetryToken;
+        if (object != "matrix" || format != "coordinate") {
+          fprintf(stderr,
+                  "Error: Unsupported Matrix Market header in %s. Expected "
+                  "'matrix coordinate'.\n",
+                  filename.c_str());
+          return EXIT_FAILURE;
+        }
+        valuesAreComplex = (valueType == "complex");
+        if (!valuesAreComplex && valueType != "real") {
+          fprintf(stderr,
+                  "Error: Unsupported value type '%s' in %s. Expected real or "
+                  "complex.\n",
+                  valueType.c_str(), filename.c_str());
+          return EXIT_FAILURE;
+        }
+        symmetry = symmetryToken;
+        continue;
+      }
+      if (line[0] == '%') {
+        continue;
+      }
+    }
+
+    if (line[0] == '%') {
+      continue;
+    }
+
+    std::istringstream dataStream(line);
+    if (!sizeFound) {
+      int ncols = 0;
+      dataStream >> n >> ncols >> declaredNnz;
+      if (!dataStream || ncols != n) {
+        fprintf(stderr,
+                "Error: Matrix in %s must be square. Parsed n=%d, m=%d.\n",
+                filename.c_str(), n, ncols);
+        return EXIT_FAILURE;
+      }
+      sizeFound = true;
+    } else {
+      int row = 0;
+      int col = 0;
+      double realPart = 0.0;
+      double imagPart = 0.0;
+      dataStream >> row >> col >> realPart;
+      if (!dataStream) {
+        fprintf(stderr, "Error: Invalid entry in %s.\n", filename.c_str());
+        return EXIT_FAILURE;
+      }
+      if (valuesAreComplex) {
+        if (!(dataStream >> imagPart)) {
+          fprintf(stderr, "Error: Missing imaginary part in %s.\n",
+                  filename.c_str());
+          return EXIT_FAILURE;
+        }
+      } else {
+        if (!(dataStream >> imagPart)) {
+          imagPart = 0.0;
+        }
+      }
+
+      row -= 1;
+      col -= 1;
+      entries.emplace_back(row, col,
+                           make_cuComplex(static_cast<float>(realPart),
+                                          static_cast<float>(imagPart)));
+      if (row < col)
+        foundUpper = true;
+      else if (row > col)
+        foundLower = true;
+    }
+  }
+  file.close();
+
+  if (!headerFound || !sizeFound) {
+    fprintf(stderr, "Error: Incomplete Matrix Market file %s.\n",
+            filename.c_str());
+    return EXIT_FAILURE;
+  }
+
+  if (declaredNnz != static_cast<int>(entries.size())) {
+    fprintf(stderr,
+            "Warning: Declared nnz=%d but read %zu entries in %s. Continuing "
+            "with read data.\n",
+            declaredNnz, entries.size(), filename.c_str());
+  }
+
+  nnz = static_cast<int>(entries.size());
+  if (nnz == 0) {
+    fprintf(stderr, "Error: Matrix file %s contains no entries.\n",
+            filename.c_str());
+    return EXIT_FAILURE;
+  }
+
+  std::string symmetryLower = symmetry;
+  std::transform(symmetryLower.begin(), symmetryLower.end(),
+                 symmetryLower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+
+  if (symmetryLower == "general") {
+    mview = CUDSS_MVIEW_FULL;
+    mtype = CUDSS_MTYPE_GENERAL;
+    isHermitian = false;
+  } else if (symmetryLower == "symmetric") {
+    isHermitian = false;
+    mview = foundLower && !foundUpper ? CUDSS_MVIEW_LOWER : CUDSS_MVIEW_UPPER;
+    mtype = CUDSS_MTYPE_SYMMETRIC;
+  } else if (symmetryLower == "hermitian") {
+    isHermitian = true;
+    mview = foundLower && !foundUpper ? CUDSS_MVIEW_LOWER : CUDSS_MVIEW_UPPER;
+    mtype = CUDSS_MTYPE_HERMITIAN;
+  } else {
+    fprintf(stderr, "Error: Unsupported symmetry '%s' in %s.\n",
+            symmetry.c_str(), filename.c_str());
+    return EXIT_FAILURE;
+  }
+
+  *csr_offsets_h = (int*)malloc((n + 1) * sizeof(int));
+  *csr_columns_h = (int*)malloc(nnz * sizeof(int));
+  *csr_values_h = (cuComplex*)malloc(nnz * sizeof(cuComplex));
+
+  if (!(*csr_offsets_h) || !(*csr_columns_h) || !(*csr_values_h)) {
+    fprintf(stderr, "Error: Host memory allocation failed while reading %s.\n",
+            filename.c_str());
+    free(*csr_offsets_h);
+    free(*csr_columns_h);
+    free(*csr_values_h);
+    *csr_offsets_h = NULL;
+    *csr_columns_h = NULL;
+    *csr_values_h = NULL;
+    return EXIT_FAILURE;
+  }
+
+  std::fill(*csr_offsets_h, *csr_offsets_h + (n + 1), 0);
+
+  std::sort(entries.begin(), entries.end(),
+            [](const std::tuple<int, int, cuComplex>& a,
+               const std::tuple<int, int, cuComplex>& b) {
+              if (std::get<0>(a) != std::get<0>(b))
+                return std::get<0>(a) < std::get<0>(b);
+              return std::get<1>(a) < std::get<1>(b);
+            });
+
+  int currentIdx = 0;
+  for (const auto& entry : entries) {
+    int row = std::get<0>(entry);
+    int col = std::get<1>(entry);
+    if (row < 0 || row >= n || col < 0 || col >= n) {
+      fprintf(stderr, "Error: Entry (%d,%d) out of bounds in %s.\n", row, col,
+              filename.c_str());
+      free(*csr_offsets_h);
+      free(*csr_columns_h);
+      free(*csr_values_h);
+      *csr_offsets_h = NULL;
+      *csr_columns_h = NULL;
+      *csr_values_h = NULL;
+      return EXIT_FAILURE;
+    }
+    (*csr_offsets_h)[row + 1]++;
+    (*csr_columns_h)[currentIdx] = col;
+    (*csr_values_h)[currentIdx] = std::get<2>(entry);
+    currentIdx++;
+  }
+
+  for (int i = 0; i < n; ++i) {
+    (*csr_offsets_h)[i + 1] += (*csr_offsets_h)[i];
+  }
+
+  return EXIT_SUCCESS;
+}
+
+static int read_rhs_matrix_market_complex(const std::string& filename,
+                                          int expected_n,
+                                          cuComplex** b_values_h) {
+  std::ifstream file(filename);
+  if (!file.is_open()) {
+    fprintf(stderr, "Error: Could not open RHS file %s\n", filename.c_str());
+    return EXIT_FAILURE;
+  }
+
+  std::string line;
+  bool headerFound = false;
+  bool sizeFound = false;
+  bool valuesAreComplex = false;
+  int declaredRows = 0;
+  int declaredCols = 0;
+
+  std::vector<cuComplex> values;
+
+  while (std::getline(file, line)) {
+    if (line.empty()) {
+      continue;
+    }
+
+    if (!headerFound) {
+      if (line.rfind("%%MatrixMarket", 0) == 0) {
+        headerFound = true;
+        std::istringstream headerStream(line);
+        std::string marker, object, format, valueType, symmetry;
+        headerStream >> marker >> object >> format >> valueType >> symmetry;
+        if (object != "matrix" || format != "array") {
+          fprintf(
+              stderr,
+              "Error: Unsupported RHS header in %s. Expected 'matrix array'.\n",
+              filename.c_str());
+          return EXIT_FAILURE;
+        }
+        valuesAreComplex = (valueType == "complex");
+        if (!valuesAreComplex && valueType != "real") {
+          fprintf(stderr, "Error: Unsupported RHS value type '%s' in %s.\n",
+                  valueType.c_str(), filename.c_str());
+          return EXIT_FAILURE;
+        }
+        continue;
+      }
+      if (line[0] == '%') {
+        continue;
+      }
+    }
+
+    if (line[0] == '%') {
+      continue;
+    }
+
+    std::istringstream dataStream(line);
+    if (!sizeFound) {
+      dataStream >> declaredRows >> declaredCols;
+      if (!dataStream || declaredCols != 1) {
+        fprintf(stderr, "Error: RHS in %s must be a single column vector.\n",
+                filename.c_str());
+        return EXIT_FAILURE;
+      }
+      if (declaredRows != expected_n) {
+        fprintf(
+            stderr,
+            "Error: RHS size mismatch: matrix has %d rows but RHS has %d.\n",
+            expected_n, declaredRows);
+        return EXIT_FAILURE;
+      }
+      sizeFound = true;
+    } else {
+      double realPart = 0.0;
+      double imagPart = 0.0;
+      dataStream >> realPart;
+      if (!dataStream) {
+        fprintf(stderr, "Error: Invalid RHS entry in %s.\n", filename.c_str());
+        return EXIT_FAILURE;
+      }
+      if (valuesAreComplex) {
+        if (!(dataStream >> imagPart)) {
+          fprintf(stderr, "Error: Missing RHS imaginary part in %s.\n",
+                  filename.c_str());
+          return EXIT_FAILURE;
+        }
+      } else {
+        if (!(dataStream >> imagPart)) {
+          imagPart = 0.0;
+        }
+      }
+      values.push_back(make_cuComplex(static_cast<float>(realPart),
+                                      static_cast<float>(imagPart)));
+    }
+  }
+
+  file.close();
+
+  if (!sizeFound || static_cast<int>(values.size()) != expected_n) {
+    fprintf(stderr, "Error: RHS file %s does not have %d entries.\n",
+            filename.c_str(), expected_n);
+    return EXIT_FAILURE;
+  }
+
+  *b_values_h = (cuComplex*)malloc(expected_n * sizeof(cuComplex));
+  if (!(*b_values_h)) {
+    fprintf(stderr, "Error: Host memory allocation failed for RHS.\n");
+    return EXIT_FAILURE;
+  }
+
+  std::copy(values.begin(), values.end(), *b_values_h);
+  return EXIT_SUCCESS;
+}
 
 int main (int argc, char *argv[]) {
     printf("---------------------------------------------------------\n");
@@ -81,87 +467,161 @@ int main (int argc, char *argv[]) {
     cudaError_t cuda_error = cudaSuccess;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
 
-    int n = 5;     // 问题规模
-    int nnz = 8;   // 非零元数量
+    int n = 0;     // 问题规模 (可能由文件决定)
+    int nnz = 0;   // 非零元数量 (可能由文件决定)
     int nrhs = 1;  // 右端项数量
 
     /* 主机端用于保存稀疏矩阵 A 的 CSR 结构以及稠密向量的缓冲区。 */
     int* csr_offsets_h = NULL;  // CSR 行偏移数组
     int* csr_columns_h = NULL;  // CSR 列索引数组
     cuComplex* csr_values_h =
-        NULL;  // CSR 非零元数组, cuComplex 类型表示float32复数
+        NULL;  // CSR 非零元数组, cuComplex 类型表示 float32 复数
     cuComplex *x_values_h = NULL, *b_values_h = NULL;  // 解向量和右端项
 
     /* 设备端（GPU）上与主机缓冲区镜像的数据，用于实际计算。 */
-    int *csr_offsets_d = NULL;
-    int *csr_columns_d = NULL;
-    cuComplex *csr_values_d = NULL;
+    int* csr_offsets_d = NULL;
+    int* csr_columns_d = NULL;
+    cuComplex* csr_values_d = NULL;
     cuComplex *x_values_d = NULL, *b_values_d = NULL;
 
-    /* Allocate host memory for the sparse input matrix A,
-       right-hand side x and solution b*/
-    /*分配主机内存*/
-    csr_offsets_h = (int*)malloc((n + 1) * sizeof(int));
-    csr_columns_h = (int*)malloc(nnz * sizeof(int));
-    csr_values_h = (cuComplex*)malloc(nnz * sizeof(cuComplex));
-    x_values_h = (cuComplex*)malloc(nrhs * n * sizeof(cuComplex));
-    b_values_h = (cuComplex*)malloc(nrhs * n * sizeof(cuComplex));
-
-    if (!csr_offsets_h || ! csr_columns_h || !csr_values_h ||
-        !x_values_h || !b_values_h) {
-        printf("Error: host memory allocation failed\n");
-        return -1;
+    /* 尝试从 Matrix Market (.mtx) 文件读取复数稀疏矩阵和
+       RHS。如果命令行提供了文件名则优先使用： 用法: ./simple_complex_example
+       <matrix_file.mtx> [rhs_file.mtx]
+       若读取失败，则回退到内置的小示例矩阵（5x5）。 */
+    bool loaded_from_file = false;
+    std::string matrix_file;
+    std::string rhs_file;
+    if (argc >= 2) {
+      matrix_file = argv[1];
+      if (argc >= 3) rhs_file = argv[2];
+    } else {
+      /* 默认尝试查找构建目录中可能存在的示例文件名 */
+      matrix_file = "A_1762908628060293_3_matrix.mtx";
+      rhs_file = "A_1762908628060293_3_rhs.mtx";
     }
 
-    /* Initialize host memory for A and b */
-    int i = 0;
-    /* CSR 行偏移数组标识每一行在列索引与数值数组中的范围。 */
-    csr_offsets_h[i++] = 0;
-    csr_offsets_h[i++] = 2;
-    csr_offsets_h[i++] = 4;
-    csr_offsets_h[i++] = 6;
-    csr_offsets_h[i++] = 7;
-    csr_offsets_h[i++] = 8;
+    cudssMatrixType_t file_mtype = CUDSS_MTYPE_GENERAL;
+    cudssMatrixViewType_t file_mview = CUDSS_MVIEW_FULL;
+    bool file_isHermitian = false;
 
-    i = 0;
-    /* 非零元对应的列索引，与下面的 csr_values_h 一一对应。 */
-    csr_columns_h[i++] = 0; csr_columns_h[i++] = 2;
-    csr_columns_h[i++] = 1; csr_columns_h[i++] = 2;
-    csr_columns_h[i++] = 2; csr_columns_h[i++] = 4;
-    csr_columns_h[i++] = 3;
-    csr_columns_h[i++] = 4;
+    if (!matrix_file.empty()) {
+      std::ifstream f(matrix_file);
+      if (f.good()) {
+        f.close();
+        if (read_matrix_market_complex(
+                matrix_file, n, nnz, &csr_offsets_h, &csr_columns_h,
+                &csr_values_h, file_mtype, file_mview, file_isHermitian) == 0) {
+          /* 如果 RHS 文件存在则读取，否则在之后填充为 1+0i */
+          if (!rhs_file.empty()) {
+            std::ifstream fr(rhs_file);
+            if (fr.good()) {
+              fr.close();
+              if (read_rhs_matrix_market_complex(rhs_file, n, &b_values_h) !=
+                  0) {
+                fprintf(
+                    stderr,
+                    "Warning: failed to read RHS file %s, using default RHS.\n",
+                    rhs_file.c_str());
+                free(b_values_h);
+                b_values_h = NULL;
+              }
+            }
+          }
 
-    i = 0;
-    /* 非零元的实部（存放在结构体成员 x 中），虚部稍后设置。 */
-    csr_values_h[i++].x = 4.0; csr_values_h[i++].x = 1.0;
-    csr_values_h[i++].x = 3.0; csr_values_h[i++].x = 2.0;
-    csr_values_h[i++].x = 5.0; csr_values_h[i++].x = 1.0;
-    csr_values_h[i++].x = 1.0;
-    csr_values_h[i++].x = 2.0;
+          if (!b_values_h) {
+            /* 如果没有 RHS，则用 1+0i 填充 */
+            b_values_h = (cuComplex*)malloc(n * sizeof(cuComplex));
+            for (int ii = 0; ii < n; ++ii)
+              b_values_h[ii] = make_cuComplex(1.0f, 0.0f);
+          }
 
-    i = 0;
-    /* 非零元的虚部（结构体成员 y）。本示例矩阵为实矩阵，因此设为 0。 */
-    csr_values_h[i++].y = 0.0; csr_values_h[i++].y = 0.0;
-    csr_values_h[i++].y = 0.0; csr_values_h[i++].y = 0.0;
-    csr_values_h[i++].y = 0.0; csr_values_h[i++].y = 0.0;
-    csr_values_h[i++].y = 0.0;
-    csr_values_h[i++].y = 0.0;
+          /* 为解分配主机内存 */
+          x_values_h = (cuComplex*)malloc(nrhs * n * sizeof(cuComplex));
+          if (!x_values_h) {
+            fprintf(stderr, "Error: host memory allocation failed for x.\n");
+            return -1;
+          }
 
-    /* Note: Right-hand side b is initialized with values which correspond
-       to the exact solution vector {1, 2, 3, 4, 5} */
-    i = 0;
-    b_values_h[i++].x = 7.0;
-    b_values_h[i++].x = 12.0;
-    b_values_h[i++].x = 25.0;
-    b_values_h[i++].x = 4.0;
-    b_values_h[i++].x = 13.0;
+          /* 从文件读取成功 */
+          loaded_from_file = true;
+        } else {
+          fprintf(stderr,
+                  "Warning: failed to read matrix file %s, falling back to "
+                  "built-in example.\n",
+                  matrix_file.c_str());
+        }
+      }
+    }
 
-    i = 0;
-    b_values_h[i++].y = 0.0;
-    b_values_h[i++].y = 0.0;
-    b_values_h[i++].y = 0.0;
-    b_values_h[i++].y = 0.0;
-    b_values_h[i++].y = 0.0;
+    /* 如果没有从文件加载成功，使用内置示例数据（保持原有行为） */
+    if (!loaded_from_file) {
+      n = 5;     // 问题规模
+      nnz = 8;   // 非零元数量
+      nrhs = 1;  // 右端项数量
+
+      /* 分配并初始化内置示例数据（与原示例一致） */
+      csr_offsets_h = (int*)malloc((n + 1) * sizeof(int));
+      csr_columns_h = (int*)malloc(nnz * sizeof(int));
+      csr_values_h = (cuComplex*)malloc(nnz * sizeof(cuComplex));
+      x_values_h = (cuComplex*)malloc(nrhs * n * sizeof(cuComplex));
+      b_values_h = (cuComplex*)malloc(nrhs * n * sizeof(cuComplex));
+
+      if (!csr_offsets_h || !csr_columns_h || !csr_values_h || !x_values_h ||
+          !b_values_h) {
+        printf("Error: host memory allocation failed\n");
+        return -1;
+      }
+
+      int ii = 0;
+      csr_offsets_h[ii++] = 0;
+      csr_offsets_h[ii++] = 2;
+      csr_offsets_h[ii++] = 4;
+      csr_offsets_h[ii++] = 6;
+      csr_offsets_h[ii++] = 7;
+      csr_offsets_h[ii++] = 8;
+
+      ii = 0;
+      csr_columns_h[ii++] = 0;
+      csr_columns_h[ii++] = 2;
+      csr_columns_h[ii++] = 1;
+      csr_columns_h[ii++] = 2;
+      csr_columns_h[ii++] = 2;
+      csr_columns_h[ii++] = 4;
+      csr_columns_h[ii++] = 3;
+      csr_columns_h[ii++] = 4;
+
+      ii = 0;
+      csr_values_h[ii++].x = 4.0;
+      csr_values_h[ii++].x = 1.0;
+      csr_values_h[ii++].x = 3.0;
+      csr_values_h[ii++].x = 2.0;
+      csr_values_h[ii++].x = 5.0;
+      csr_values_h[ii++].x = 1.0;
+      csr_values_h[ii++].x = 1.0;
+      csr_values_h[ii++].x = 2.0;
+      ii = 0;
+      csr_values_h[ii++].y = 0.0;
+      csr_values_h[ii++].y = 0.0;
+      csr_values_h[ii++].y = 0.0;
+      csr_values_h[ii++].y = 0.0;
+      csr_values_h[ii++].y = 0.0;
+      csr_values_h[ii++].y = 0.0;
+      csr_values_h[ii++].y = 0.0;
+      csr_values_h[ii++].y = 0.0;
+
+      ii = 0;
+      b_values_h[ii++].x = 7.0;
+      b_values_h[ii++].x = 12.0;
+      b_values_h[ii++].x = 25.0;
+      b_values_h[ii++].x = 4.0;
+      b_values_h[ii++].x = 13.0;
+      ii = 0;
+      b_values_h[ii++].y = 0.0;
+      b_values_h[ii++].y = 0.0;
+      b_values_h[ii++].y = 0.0;
+      b_values_h[ii++].y = 0.0;
+      b_values_h[ii++].y = 0.0;
+    }
 
     /* Allocate device memory for A, x and b */
     /*分配设备内存*/
@@ -230,8 +690,11 @@ int main (int argc, char *argv[]) {
 
     /* Create a matrix object for the sparse input matrix. */
     cudssMatrix_t A;
-    cudssMatrixType_t mtype = CUDSS_MTYPE_SPD;        // 矩阵类型：对称正定
-    cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;  // 只存储上三角部分
+    /* 如果从文件加载，使用文件提供的类型和视图；否则保持原示例的默认设置 */
+    cudssMatrixType_t mtype =
+        loaded_from_file ? file_mtype : CUDSS_MTYPE_SPD;  // 矩阵类型
+    cudssMatrixViewType_t mview =
+        loaded_from_file ? file_mview : CUDSS_MVIEW_UPPER;  // 存储视图
     cudssIndexBase_t base = CUDSS_BASE_ZERO;          // 索引从 0 开始
 
     /*解释每个变量的含义:
@@ -270,16 +733,28 @@ int main (int argc, char *argv[]) {
 
     CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
-    /* Print the solution and compare against the exact solution */
-    CUDA_CALL_AND_CHECK(cudaMemcpy(x_values_h, x_values_d, nrhs * n * sizeof(cuComplex),
-                        cudaMemcpyDeviceToHost), "cudaMemcpy for x_values");
+    /* Print the solution. If we loaded the matrix from a file, compute the
+       residual norm ||Ax - b|| to validate the solution; otherwise compare
+       against the small built-in exact solution {1,2,..,n}. */
+    CUDA_CALL_AND_CHECK(
+        cudaMemcpy(x_values_h, x_values_d, nrhs * n * sizeof(cuComplex),
+                   cudaMemcpyDeviceToHost),
+        "cudaMemcpy for x_values");
 
     int passed = 1;
-    for (int i = 0; i < n; i++) {
+    if (loaded_from_file) {
+      float residual = compute_complex_residual_norm(
+          n, csr_offsets_h, csr_columns_h, csr_values_h, x_values_h, b_values_h,
+          mview, file_isHermitian);
+      printf("Residual (absolute) L2 norm ||Ax-b|| = %e\n", (double)residual);
+      passed = (residual < 1e-3f); /* tolerance for sample; adjust as needed */
+    } else {
+      for (int i = 0; i < n; i++) {
         printf("x[%d] = (%1.4f, %1.4f) expected (%1.4f, 0)\n", i,
-               x_values_h[i].x, x_values_h[i].y, double(i+1));
+               x_values_h[i].x, x_values_h[i].y, double(i + 1));
         if (fabs(x_values_h[i].x - (i + 1)) + fabs(x_values_h[i].y) > 2.e-6)
-            passed = 0;
+          passed = 0;
+      }
     }
 
     /* Release the data allocated on the user side */
