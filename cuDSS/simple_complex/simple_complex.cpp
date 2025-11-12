@@ -248,27 +248,29 @@ int run_example(const ExampleInput& input) {
     b_values_h = nullptr;
   };
 
-  auto check_cuda = [&](cudaError_t err, const char* msg) -> int {
-    if (err != cudaSuccess) {
-      printf("Example FAILED: CUDA API returned error = %d, details: %s\n",
-             static_cast<int>(err), msg);
-      cleanup();
-      return -1;
-    }
-    return 0;
-  };
+#define CUDA_CALL_AND_CHECK(call, msg)                                      \
+  do {                                                                      \
+    cudaError_t _cuda_error = (call);                                       \
+    if (_cuda_error != cudaSuccess) {                                       \
+      printf("Example FAILED: CUDA API returned error = %d, details: %s\n", \
+             static_cast<int>(_cuda_error), (msg));                         \
+      cleanup();                                                            \
+      return -1;                                                            \
+    }                                                                       \
+  } while (0)
 
-  auto check_cudss = [&](cudssStatus_t status, const char* msg) -> int {
-    if (status != CUDSS_STATUS_SUCCESS) {
-      printf(
-          "Example FAILED: CUDSS call ended unsuccessfully with status = %d, "
-          "details: %s\n",
-          static_cast<int>(status), msg);
-      cleanup();
-      return -2;
-    }
-    return 0;
-  };
+#define CUDSS_CALL_AND_CHECK(call, msg)                                    \
+  do {                                                                     \
+    cudssStatus_t _cudss_status = (call);                                  \
+    if (_cudss_status != CUDSS_STATUS_SUCCESS) {                           \
+      printf(                                                              \
+          "Example FAILED: CUDSS call ended unsuccessfully with status = " \
+          "%d, details: %s\n",                                             \
+          static_cast<int>(_cudss_status), (msg));                         \
+      cleanup();                                                           \
+      return -2;                                                           \
+    }                                                                      \
+  } while (0)
 
   if (!input.matrix_path.empty()) {
     std::ifstream matrix_stream(input.matrix_path);
@@ -395,241 +397,132 @@ int run_example(const ExampleInput& input) {
     }
   }
 
-  {
-    int err = check_cuda(
-        cudaMalloc(&csr_offsets_d, static_cast<size_t>(n + 1) * sizeof(int)),
-        "cudaMalloc csr_offsets");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(
-        cudaMalloc(&csr_columns_d, static_cast<size_t>(nnz) * sizeof(int)),
-        "cudaMalloc csr_columns");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(
-        cudaMalloc(&csr_values_d, static_cast<size_t>(nnz) * sizeof(ComplexT)),
-        "cudaMalloc csr_values");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaMalloc(&b_values_d, static_cast<size_t>(nrhs) * n *
-                                                     sizeof(ComplexT)),
-                         "cudaMalloc b_values");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaMalloc(&x_values_d, static_cast<size_t>(nrhs) * n *
-                                                     sizeof(ComplexT)),
-                         "cudaMalloc x_values");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(
+      cudaMalloc(&csr_offsets_d, static_cast<size_t>(n + 1) * sizeof(int)),
+      "cudaMalloc csr_offsets");
+  CUDA_CALL_AND_CHECK(
+      cudaMalloc(&csr_columns_d, static_cast<size_t>(nnz) * sizeof(int)),
+      "cudaMalloc csr_columns");
+  CUDA_CALL_AND_CHECK(
+      cudaMalloc(&csr_values_d, static_cast<size_t>(nnz) * sizeof(ComplexT)),
+      "cudaMalloc csr_values");
+  CUDA_CALL_AND_CHECK(
+      cudaMalloc(&b_values_d, static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
+      "cudaMalloc b_values");
+  CUDA_CALL_AND_CHECK(
+      cudaMalloc(&x_values_d, static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
+      "cudaMalloc x_values");
 
-  {
-    int err = check_cuda(cudaMemcpy(csr_offsets_d, csr_offsets_h,
-                                    static_cast<size_t>(n + 1) * sizeof(int),
-                                    cudaMemcpyHostToDevice),
-                         "cudaMemcpy csr_offsets");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaMemcpy(csr_columns_d, csr_columns_h,
-                                    static_cast<size_t>(nnz) * sizeof(int),
-                                    cudaMemcpyHostToDevice),
-                         "cudaMemcpy csr_columns");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaMemcpy(csr_values_d, csr_values_h,
-                                    static_cast<size_t>(nnz) * sizeof(ComplexT),
-                                    cudaMemcpyHostToDevice),
-                         "cudaMemcpy csr_values");
-    if (err) return err;
-  }
-  {
-    int err =
-        check_cuda(cudaMemcpy(b_values_d, b_values_h,
-                              static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
-                              cudaMemcpyHostToDevice),
-                   "cudaMemcpy b_values");
-    if (err) return err;
-  }
-  {
-    int err =
-        check_cuda(cudaMemset(x_values_d, 0,
-                              static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
-                   "cudaMemset x_values");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(cudaMemcpy(csr_offsets_d, csr_offsets_h,
+                                 static_cast<size_t>(n + 1) * sizeof(int),
+                                 cudaMemcpyHostToDevice),
+                      "cudaMemcpy csr_offsets");
+  CUDA_CALL_AND_CHECK(cudaMemcpy(csr_columns_d, csr_columns_h,
+                                 static_cast<size_t>(nnz) * sizeof(int),
+                                 cudaMemcpyHostToDevice),
+                      "cudaMemcpy csr_columns");
+  CUDA_CALL_AND_CHECK(cudaMemcpy(csr_values_d, csr_values_h,
+                                 static_cast<size_t>(nnz) * sizeof(ComplexT),
+                                 cudaMemcpyHostToDevice),
+                      "cudaMemcpy csr_values");
+  CUDA_CALL_AND_CHECK(
+      cudaMemcpy(b_values_d, b_values_h,
+                 static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
+                 cudaMemcpyHostToDevice),
+      "cudaMemcpy b_values");
+  CUDA_CALL_AND_CHECK(
+      cudaMemset(x_values_d, 0,
+                 static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
+      "cudaMemset x_values");
 
-  {
-    int err = check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(cudaStreamCreate(&stream), "cudaStreamCreate");
 
-  {
-    int err =
-        check_cuda(cudaEventCreate(&event_start), "cudaEventCreate (start)");
-    if (err) return err;
-  }
-  {
-    int err =
-        check_cuda(cudaEventCreate(&event_stop), "cudaEventCreate (stop)");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(cudaEventCreate(&event_start), "cudaEventCreate (start)");
+  CUDA_CALL_AND_CHECK(cudaEventCreate(&event_stop), "cudaEventCreate (stop)");
 
-  {
-    int err = check_cudss(cudssCreate(&handle), "cudssCreate");
-    if (err) return err;
-  }
-  {
-    int err = check_cudss(cudssSetStream(handle, stream), "cudssSetStream");
-    if (err) return err;
-  }
-  {
-    int err =
-        check_cudss(cudssConfigCreate(&solver_config), "cudssConfigCreate");
-    if (err) return err;
-  }
-  {
-    int err =
-        check_cudss(cudssDataCreate(handle, &solver_data), "cudssDataCreate");
-    if (err) return err;
-  }
+  CUDSS_CALL_AND_CHECK(cudssCreate(&handle), "cudssCreate");
+  CUDSS_CALL_AND_CHECK(cudssSetStream(handle, stream), "cudssSetStream");
+  CUDSS_CALL_AND_CHECK(cudssConfigCreate(&solver_config), "cudssConfigCreate");
+  CUDSS_CALL_AND_CHECK(cudssDataCreate(handle, &solver_data),
+                       "cudssDataCreate");
 
   int64_t nrows = n;
   int64_t ncols = n;
   int ldb = ncols;
   int ldx = nrows;
 
-  {
-    int err = check_cudss(
-        cudssMatrixCreateDn(&b, ncols, nrhs, ldb, b_values_d, Traits::kCudaType,
-                            CUDSS_LAYOUT_COL_MAJOR),
-        "cudssMatrixCreateDn (b)");
-    if (err) return err;
-  }
-  {
-    int err = check_cudss(
-        cudssMatrixCreateDn(&x, nrows, nrhs, ldx, x_values_d, Traits::kCudaType,
-                            CUDSS_LAYOUT_COL_MAJOR),
-        "cudssMatrixCreateDn (x)");
-    if (err) return err;
-  }
+  CUDSS_CALL_AND_CHECK(
+      cudssMatrixCreateDn(&b, ncols, nrhs, ldb, b_values_d, Traits::kCudaType,
+                          CUDSS_LAYOUT_COL_MAJOR),
+      "cudssMatrixCreateDn (b)");
+  CUDSS_CALL_AND_CHECK(
+      cudssMatrixCreateDn(&x, nrows, nrhs, ldx, x_values_d, Traits::kCudaType,
+                          CUDSS_LAYOUT_COL_MAJOR),
+      "cudssMatrixCreateDn (x)");
 
   cudssIndexBase_t base = CUDSS_BASE_ZERO;
-  {
-    int err = check_cudss(
-        cudssMatrixCreateCsr(&A, nrows, ncols, nnz, csr_offsets_d, nullptr,
-                             csr_columns_d, csr_values_d, CUDA_R_32I,
-                             Traits::kCudaType, matrix_type, matrix_view, base),
-        "cudssMatrixCreateCsr");
-    if (err) return err;
-  }
+  CUDSS_CALL_AND_CHECK(
+      cudssMatrixCreateCsr(&A, nrows, ncols, nnz, csr_offsets_d, nullptr,
+                           csr_columns_d, csr_values_d, CUDA_R_32I,
+                           Traits::kCudaType, matrix_type, matrix_view, base),
+      "cudssMatrixCreateCsr");
 
-  {
-    int err = check_cuda(cudaEventRecord(event_start, stream),
-                         "cudaEventRecord (analysis start)");
-    if (err) return err;
-  }
-  {
-    int err = check_cudss(cudssExecute(handle, CUDSS_PHASE_ANALYSIS,
-                                       solver_config, solver_data, A, x, b),
-                          "cudssExecute (analysis)");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaEventRecord(event_stop, stream),
-                         "cudaEventRecord (analysis stop)");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaEventSynchronize(event_stop),
-                         "cudaEventSynchronize (analysis)");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
+                      "cudaEventRecord (analysis start)");
+  CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, solver_config,
+                                    solver_data, A, x, b),
+                       "cudssExecute (analysis)");
+  CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream),
+                      "cudaEventRecord (analysis stop)");
+  CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop),
+                      "cudaEventSynchronize (analysis)");
   {
     float elapsed_ms = 0.0f;
-    int err =
-        check_cuda(cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
-                   "cudaEventElapsedTime (analysis)");
-    if (err) return err;
+    CUDA_CALL_AND_CHECK(
+        cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+        "cudaEventElapsedTime (analysis)");
     analysis_ms = static_cast<double>(elapsed_ms);
   }
-  {
-    int err = check_cuda(cudaEventRecord(event_start, stream),
-                         "cudaEventRecord (factor start)");
-    if (err) return err;
-  }
-  {
-    int err = check_cudss(cudssExecute(handle, CUDSS_PHASE_FACTORIZATION,
-                                       solver_config, solver_data, A, x, b),
-                          "cudssExecute (factor)");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaEventRecord(event_stop, stream),
-                         "cudaEventRecord (factor stop)");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaEventSynchronize(event_stop),
-                         "cudaEventSynchronize (factor)");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
+                      "cudaEventRecord (factor start)");
+  CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_FACTORIZATION,
+                                    solver_config, solver_data, A, x, b),
+                       "cudssExecute (factor)");
+  CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream),
+                      "cudaEventRecord (factor stop)");
+  CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop),
+                      "cudaEventSynchronize (factor)");
   {
     float elapsed_ms = 0.0f;
-    int err =
-        check_cuda(cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
-                   "cudaEventElapsedTime (factor)");
-    if (err) return err;
+    CUDA_CALL_AND_CHECK(
+        cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+        "cudaEventElapsedTime (factor)");
     factor_ms = static_cast<double>(elapsed_ms);
   }
-  {
-    int err = check_cuda(cudaEventRecord(event_start, stream),
-                         "cudaEventRecord (solve start)");
-    if (err) return err;
-  }
-  {
-    int err = check_cudss(cudssExecute(handle, CUDSS_PHASE_SOLVE, solver_config,
-                                       solver_data, A, x, b),
-                          "cudssExecute (solve)");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaEventRecord(event_stop, stream),
-                         "cudaEventRecord (solve stop)");
-    if (err) return err;
-  }
-  {
-    int err = check_cuda(cudaEventSynchronize(event_stop),
-                         "cudaEventSynchronize (solve)");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
+                      "cudaEventRecord (solve start)");
+  CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_SOLVE, solver_config,
+                                    solver_data, A, x, b),
+                       "cudssExecute (solve)");
+  CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream),
+                      "cudaEventRecord (solve stop)");
+  CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop),
+                      "cudaEventSynchronize (solve)");
   {
     float elapsed_ms = 0.0f;
-    int err =
-        check_cuda(cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
-                   "cudaEventElapsedTime (solve)");
-    if (err) return err;
+    CUDA_CALL_AND_CHECK(
+        cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+        "cudaEventElapsedTime (solve)");
     solve_ms = static_cast<double>(elapsed_ms);
   }
 
-  {
-    int err =
-        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
-  {
-    int err =
-        check_cuda(cudaMemcpy(x_values_h, x_values_d,
-                              static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
-                              cudaMemcpyDeviceToHost),
-                   "cudaMemcpy x_values");
-    if (err) return err;
-  }
+  CUDA_CALL_AND_CHECK(
+      cudaMemcpy(x_values_h, x_values_d,
+                 static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
+                 cudaMemcpyDeviceToHost),
+      "cudaMemcpy x_values");
 
   printf("Precision: %s\n", Traits::kName);
   double total_ms = analysis_ms + factor_ms + solve_ms;
@@ -661,6 +554,9 @@ int run_example(const ExampleInput& input) {
   }
 
   cleanup();
+
+#undef CUDSS_CALL_AND_CHECK
+#undef CUDA_CALL_AND_CHECK
 
   if (passed) {
     printf("Example PASSED\n");

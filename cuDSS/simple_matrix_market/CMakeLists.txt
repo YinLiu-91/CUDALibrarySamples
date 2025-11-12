@@ -39,6 +39,9 @@ target_sources(${EXAMPLE_NAME}_example
     PUBLIC ${PROJECT_SOURCE_DIR}/${EXAMPLE_NAME}.cpp
 )
 
+target_include_directories(${EXAMPLE_NAME}_example
+    PRIVATE ${PROJECT_SOURCE_DIR}/../common)
+
 if (WIN32)
     target_include_directories(${EXAMPLE_NAME}_example PUBLIC ${cudss_INCLUDE_DIR})
     target_link_directories(${EXAMPLE_NAME}_example PUBLIC ${cudss_LIBRARY_DIR})
@@ -59,6 +62,9 @@ if(BUILD_STATIC)
     target_sources(${EXAMPLE_NAME}_example_static
         PUBLIC ${PROJECT_SOURCE_DIR}/${EXAMPLE_NAME}.cpp
     )
+
+    target_include_directories(${EXAMPLE_NAME}_example_static
+        PRIVATE ${PROJECT_SOURCE_DIR}/../common)
 
     if (WIN32)
         target_include_directories(${EXAMPLE_NAME}_example_static PUBLIC ${cudss_INCLUDE_DIR})

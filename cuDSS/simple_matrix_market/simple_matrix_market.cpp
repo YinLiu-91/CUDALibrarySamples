@@ -17,14 +17,16 @@
 
 #include <assert.h>
 #include <cuda_runtime.h>
-#include <iostream>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#include <cstring>
+#include <iostream>
 #include <vector>
 
 #include "cudss.h"
-#include "matrix_market_reader.h"
+#include "matrix_market_reader_complex.h"
 
 /*
     This example demonstrates basic usage of cuDSS APIs for solving
@@ -173,16 +175,16 @@ int main(int argc, char *argv[]) {
 
     // Parse matrix type
     cudssMatrixType_t mtype;
-    if (strcmp(argv[2], "general") == 0)
-        mtype = CUDSS_MTYPE_GENERAL;
-    else if (strcmp(argv[2], "symmetric") == 0)
-        mtype = CUDSS_MTYPE_SYMMETRIC;
-    else if (strcmp(argv[2], "hermitian") == 0)
-        mtype = CUDSS_MTYPE_HERMITIAN;
-    else if (strcmp(argv[2], "spd") == 0)
-        mtype = CUDSS_MTYPE_SPD;
-    else if (strcmp(argv[2], "hpd") == 0)
-        mtype = CUDSS_MTYPE_HPD;
+    if (std::strcmp(argv[2], "general") == 0)
+      mtype = CUDSS_MTYPE_GENERAL;
+    else if (std::strcmp(argv[2], "symmetric") == 0)
+      mtype = CUDSS_MTYPE_SYMMETRIC;
+    else if (std::strcmp(argv[2], "hermitian") == 0)
+      mtype = CUDSS_MTYPE_HERMITIAN;
+    else if (std::strcmp(argv[2], "spd") == 0)
+      mtype = CUDSS_MTYPE_SPD;
+    else if (std::strcmp(argv[2], "hpd") == 0)
+      mtype = CUDSS_MTYPE_HPD;
     else {
         fprintf(stderr,
                 "Error: Invalid matrix type '%s'. Supported types are general, "
@@ -201,12 +203,12 @@ int main(int argc, char *argv[]) {
 
     // Parse matrix view
     cudssMatrixViewType_t mview;
-    if (strcmp(argv[3], "full") == 0)
-        mview = CUDSS_MVIEW_FULL;
-    else if (strcmp(argv[3], "lower") == 0)
-        mview = CUDSS_MVIEW_LOWER;
-    else if (strcmp(argv[3], "upper") == 0)
-        mview = CUDSS_MVIEW_UPPER;
+    if (std::strcmp(argv[3], "full") == 0)
+      mview = CUDSS_MVIEW_FULL;
+    else if (std::strcmp(argv[3], "lower") == 0)
+      mview = CUDSS_MVIEW_LOWER;
+    else if (std::strcmp(argv[3], "upper") == 0)
+      mview = CUDSS_MVIEW_UPPER;
     else {
         fprintf(stderr,
                 "Error: Invalid matrix view type '%s'. Supported types are: full, lower, "
@@ -240,11 +242,20 @@ int main(int argc, char *argv[]) {
     double *x_values_d = NULL, *b_values_d = NULL;
 
     /* Read input matrix from file and allocate host memory accordingly */
-    int failed = matrix_reader(matrix_filename, n, nnz, &csr_offsets_h, &csr_columns_h,
-                               &csr_values_h, mview);
-    if (failed) {
-        fprintf(stderr, "Reader failed.\n");
-        return EXIT_FAILURE;
+    matrix_market::MatrixMetadata metadata;
+    matrix_market::MatrixReadOptions read_options;
+    read_options.requested_view = mview;
+    read_options.allow_real_as_complex = false;
+    read_options.enforce_declared_nnz = true;
+
+    matrix_market::Status matrix_status =
+        matrix_market::read_matrix_coordinate<double>(
+            matrix_filename, n, nnz, &csr_offsets_h, &csr_columns_h,
+            &csr_values_h, &metadata, read_options);
+    if (matrix_status != matrix_market::Status::kSuccess) {
+      fprintf(stderr, "Reader failed (%s).\n",
+              matrix_market::StatusToString(matrix_status));
+      return EXIT_FAILURE;
     }
 
     printf("---------------------------------------------------------\n");
@@ -258,11 +269,13 @@ int main(int argc, char *argv[]) {
     /* Allocate host memory for right hand side b and fill it*/
     /* Read from file if rhs file is provided */
     if (vector_filename != nullptr) {
-        int failed = rhs_reader(vector_filename, n, &b_values_h);
-        if (failed) {
-            fprintf(stderr, "Reader failed.\n");
-            return EXIT_FAILURE;
-        }
+      matrix_market::Status rhs_status = matrix_market::read_rhs_array<double>(
+          vector_filename, n, &b_values_h, false);
+      if (rhs_status != matrix_market::Status::kSuccess) {
+        fprintf(stderr, "Reader failed (%s).\n",
+                matrix_market::StatusToString(rhs_status));
+        return EXIT_FAILURE;
+      }
     } else {
         printf("No rhs file provided, filling b with 1.0");
         b_values_h = (double *)malloc(nrhs * n * sizeof(double));
