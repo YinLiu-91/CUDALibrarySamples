@@ -158,6 +158,8 @@ int run_example(const ExampleInput& input) {
   ComplexT* b_values_d = nullptr;
 
   cudaStream_t stream = nullptr;
+  cudaEvent_t event_start = nullptr;
+  cudaEvent_t event_stop = nullptr;
   cudssHandle_t handle = nullptr;
   cudssConfig_t solver_config = nullptr;
   cudssData_t solver_data = nullptr;
@@ -169,6 +171,10 @@ int run_example(const ExampleInput& input) {
   cudssMatrixType_t matrix_type = CUDSS_MTYPE_SPD;
   cudssMatrixViewType_t matrix_view = CUDSS_MVIEW_UPPER;
   bool matrix_is_hermitian = false;
+
+  double analysis_ms = 0.0;
+  double factor_ms = 0.0;
+  double solve_ms = 0.0;
 
   auto cleanup = [&]() {
     if (A) {
@@ -198,6 +204,14 @@ int run_example(const ExampleInput& input) {
     if (stream) {
       cudaStreamDestroy(stream);
       stream = nullptr;
+    }
+    if (event_start) {
+      cudaEventDestroy(event_start);
+      event_start = nullptr;
+    }
+    if (event_stop) {
+      cudaEventDestroy(event_stop);
+      event_stop = nullptr;
     }
 
     if (csr_offsets_d) {
@@ -455,6 +469,17 @@ int run_example(const ExampleInput& input) {
   }
 
   {
+    int err =
+        check_cuda(cudaEventCreate(&event_start), "cudaEventCreate (start)");
+    if (err) return err;
+  }
+  {
+    int err =
+        check_cuda(cudaEventCreate(&event_stop), "cudaEventCreate (stop)");
+    if (err) return err;
+  }
+
+  {
     int err = check_cudss(cudssCreate(&handle), "cudssCreate");
     if (err) return err;
   }
@@ -504,9 +529,37 @@ int run_example(const ExampleInput& input) {
   }
 
   {
+    int err = check_cuda(cudaEventRecord(event_start, stream),
+                         "cudaEventRecord (analysis start)");
+    if (err) return err;
+  }
+  {
     int err = check_cudss(cudssExecute(handle, CUDSS_PHASE_ANALYSIS,
                                        solver_config, solver_data, A, x, b),
                           "cudssExecute (analysis)");
+    if (err) return err;
+  }
+  {
+    int err = check_cuda(cudaEventRecord(event_stop, stream),
+                         "cudaEventRecord (analysis stop)");
+    if (err) return err;
+  }
+  {
+    int err = check_cuda(cudaEventSynchronize(event_stop),
+                         "cudaEventSynchronize (analysis)");
+    if (err) return err;
+  }
+  {
+    float elapsed_ms = 0.0f;
+    int err =
+        check_cuda(cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+                   "cudaEventElapsedTime (analysis)");
+    if (err) return err;
+    analysis_ms = static_cast<double>(elapsed_ms);
+  }
+  {
+    int err = check_cuda(cudaEventRecord(event_start, stream),
+                         "cudaEventRecord (factor start)");
     if (err) return err;
   }
   {
@@ -516,10 +569,51 @@ int run_example(const ExampleInput& input) {
     if (err) return err;
   }
   {
+    int err = check_cuda(cudaEventRecord(event_stop, stream),
+                         "cudaEventRecord (factor stop)");
+    if (err) return err;
+  }
+  {
+    int err = check_cuda(cudaEventSynchronize(event_stop),
+                         "cudaEventSynchronize (factor)");
+    if (err) return err;
+  }
+  {
+    float elapsed_ms = 0.0f;
+    int err =
+        check_cuda(cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+                   "cudaEventElapsedTime (factor)");
+    if (err) return err;
+    factor_ms = static_cast<double>(elapsed_ms);
+  }
+  {
+    int err = check_cuda(cudaEventRecord(event_start, stream),
+                         "cudaEventRecord (solve start)");
+    if (err) return err;
+  }
+  {
     int err = check_cudss(cudssExecute(handle, CUDSS_PHASE_SOLVE, solver_config,
                                        solver_data, A, x, b),
                           "cudssExecute (solve)");
     if (err) return err;
+  }
+  {
+    int err = check_cuda(cudaEventRecord(event_stop, stream),
+                         "cudaEventRecord (solve stop)");
+    if (err) return err;
+  }
+  {
+    int err = check_cuda(cudaEventSynchronize(event_stop),
+                         "cudaEventSynchronize (solve)");
+    if (err) return err;
+  }
+  {
+    float elapsed_ms = 0.0f;
+    int err =
+        check_cuda(cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+                   "cudaEventElapsedTime (solve)");
+    if (err) return err;
+    solve_ms = static_cast<double>(elapsed_ms);
   }
 
   {
@@ -538,6 +632,11 @@ int run_example(const ExampleInput& input) {
   }
 
   printf("Precision: %s\n", Traits::kName);
+  double total_ms = analysis_ms + factor_ms + solve_ms;
+  printf(
+      "Timing (ms): analysis=%0.3f, factorization=%0.3f, solve=%0.3f, "
+      "total=%0.3f\n",
+      analysis_ms, factor_ms, solve_ms, total_ms);
   bool passed = true;
 
   if (loaded_from_file) {
