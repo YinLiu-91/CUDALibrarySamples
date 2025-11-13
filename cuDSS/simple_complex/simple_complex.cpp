@@ -153,6 +153,59 @@ std::string make_solution_output_path(const std::string& matrix_path) {
   return result + "_solution.mtx";
 }
 
+std::string make_golden_solution_path(const std::string& matrix_path) {
+  if (matrix_path.empty()) {
+    return std::string();
+  }
+
+  std::string result = matrix_path;
+  size_t slash = result.find_last_of("/\\");
+  size_t dot = result.find_last_of('.');
+  std::string prefix;
+  if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
+    prefix = result.substr(0, dot);
+  } else {
+    prefix = result;
+  }
+
+  const std::string matrix_suffix = "_matrix";
+  if (prefix.size() >= matrix_suffix.size()) {
+    size_t pos = prefix.rfind(matrix_suffix);
+    if (pos != std::string::npos &&
+        pos + matrix_suffix.size() == prefix.size()) {
+      prefix = prefix.substr(0, pos);
+    }
+  }
+
+  return prefix + "_golden_sol.mtx";
+}
+
+template <typename ComplexT>
+double compute_solution_error_norm(int n, const ComplexT* solution,
+                                   const ComplexT* reference,
+                                   double* relative_norm_out) {
+  using Traits = PrecisionTraits<ComplexT>;
+  double diff_norm_sq = 0.0;
+  double ref_norm_sq = 0.0;
+
+  for (int i = 0; i < n; ++i) {
+    ComplexT diff = Traits::sub(solution[i], reference[i]);
+    diff_norm_sq += Traits::norm_sq(diff);
+    ref_norm_sq += Traits::norm_sq(reference[i]);
+  }
+
+  double diff_norm = std::sqrt(diff_norm_sq);
+  double ref_norm = std::sqrt(ref_norm_sq);
+  if (relative_norm_out) {
+    if (ref_norm > 0.0) {
+      *relative_norm_out = diff_norm / ref_norm;
+    } else {
+      *relative_norm_out = 0.0;
+    }
+  }
+  return diff_norm;
+}
+
 template <typename ComplexT>
 bool write_solution_matrix_market(const std::string& path, int nrows, int ncols,
                                   const ComplexT* values) {
@@ -580,6 +633,30 @@ int run_example(const ExampleInput& input) {
     if (residual >= Traits::residual_tolerance()) {
       passed = false;
     }
+
+    std::string golden_path = make_golden_solution_path(input.matrix_path);
+    if (!golden_path.empty()) {
+      std::ifstream golden_stream(golden_path.c_str());
+      if (golden_stream.good()) {
+        golden_stream.close();
+        ComplexT* golden_values = nullptr;
+        matrix_market::Status golden_status =
+            matrix_market::read_rhs_array<ComplexT>(golden_path, n,
+                                                    &golden_values, true);
+        if (golden_status == matrix_market::Status::kSuccess) {
+          double relative_error = 0.0;
+          double abs_error = compute_solution_error_norm<ComplexT>(
+              n, x_values_h, golden_values, &relative_error);
+          printf("Solution error vs golden (L2): absolute=%e relative=%e\n",
+                 abs_error, relative_error);
+          free(golden_values);
+        } else {
+          fprintf(stderr, "Warning: failed to read golden solution %s (%s)\n",
+                  golden_path.c_str(),
+                  matrix_market::StatusToString(golden_status));
+        }
+      }
+    }
   } else {
     for (int i = 0; i < n; ++i) {
       double xr = Traits::real(x_values_h[i]);
@@ -620,6 +697,12 @@ int run_example(const ExampleInput& input) {
 
 }  // namespace
 
+/*
+运行命令： ./simple_complex_example -s
+../cfm56-case/A_1762995034677701_3_matrix.mtx
+../cfm56-case/A_1762995034677701_3_rhs.mtx
+其中：-s表示使用单精度复数（complex64），-d表示使用双精度复数（complex128）
+*/
 int main(int argc, char* argv[]) {
   printf("---------------------------------------------------------\n");
   printf(
