@@ -35,6 +35,7 @@
 
 namespace {
 
+// 用于封装命令行输入的辅助结构体，记录稀疏矩阵、右端向量来源
 struct ExampleInput {
   std::string matrix_path;
   std::string rhs_path;
@@ -42,11 +43,13 @@ struct ExampleInput {
   bool rhs_from_cli = false;
 };
 
+// 运行时支持的精度模式，目前包括单精度和双精度复数
 enum class PrecisionMode { kComplex64, kComplex128 };
 
 template <typename ComplexT>
 struct PrecisionTraits;
 
+// 针对 cuComplex（单精度复数）的 traits，用于屏蔽不同精度下 API 差异
 template <>
 struct PrecisionTraits<cuComplex> {
   using ComplexType = cuComplex;
@@ -76,6 +79,7 @@ struct PrecisionTraits<cuComplex> {
   static double solution_tolerance() { return 2e-6; }
 };
 
+// 针对 cuDoubleComplex（双精度复数）的 traits，与单精度实现对应
 template <>
 struct PrecisionTraits<cuDoubleComplex> {
   using ComplexType = cuDoubleComplex;
@@ -106,6 +110,7 @@ struct PrecisionTraits<cuDoubleComplex> {
   static double solution_tolerance() { return 1e-12; }
 };
 
+// 计算稀疏矩阵 A 与解向量 x 的乘积 Ax，并与 b 做差得到残差范数
 template <typename ComplexT>
 double compute_complex_residual_norm(
     int n, const int* csr_offsets_h, const int* csr_columns_h,
@@ -121,9 +126,13 @@ double compute_complex_residual_norm(
       Ax[row] = Traits::add(Ax[row], Traits::mul(val, x_values_h[col]));
 
       if (view == CUDSS_MVIEW_UPPER && col != row) {
+        // 如果矩阵是厄米特矩阵，那么存储的上三角元素被镜像到对应的下三角位置时
+        // 需要取共轭，保证恢复出的完整矩阵满足 A =
+        // A^H；非厄米特矩阵则直接复制即可。
         ComplexT mirrored = is_hermitian ? Traits::conj(val) : val;
         Ax[col] = Traits::add(Ax[col], Traits::mul(mirrored, x_values_h[row]));
       } else if (view == CUDSS_MVIEW_LOWER && col != row) {
+        // 同理，当只存储了下三角视图时，镜像到上三角也要根据是否厄米特决定是否取共轭。
         ComplexT mirrored = is_hermitian ? Traits::conj(val) : val;
         Ax[col] = Traits::add(Ax[col], Traits::mul(mirrored, x_values_h[row]));
       }
@@ -138,6 +147,7 @@ double compute_complex_residual_norm(
   return std::sqrt(norm_sq);
 }
 
+// 根据输入矩阵路径生成解向量输出文件名，默认追加 "_solution.mtx"
 std::string make_solution_output_path(const std::string& matrix_path) {
   if (matrix_path.empty()) {
     return "solution_x.mtx";
@@ -153,6 +163,7 @@ std::string make_solution_output_path(const std::string& matrix_path) {
   return result + "_solution.mtx";
 }
 
+// 尝试依据矩阵路径推导黄金解（golden solution）文件位置
 std::string make_golden_solution_path(const std::string& matrix_path) {
   if (matrix_path.empty()) {
     return std::string();
@@ -180,6 +191,7 @@ std::string make_golden_solution_path(const std::string& matrix_path) {
   return prefix + "_golden_sol.mtx";
 }
 
+// 依据 L2 范数评估当前解与参考解的差异，同时可以返回相对误差
 template <typename ComplexT>
 double compute_solution_error_norm(int n, const ComplexT* solution,
                                    const ComplexT* reference,
@@ -206,6 +218,7 @@ double compute_solution_error_norm(int n, const ComplexT* solution,
   return diff_norm;
 }
 
+// 将列主序存储的解向量写成 Matrix Market array 格式，便于后处理
 template <typename ComplexT>
 bool write_solution_matrix_market(const std::string& path, int nrows, int ncols,
                                   const ComplexT* values) {
@@ -230,6 +243,7 @@ bool write_solution_matrix_market(const std::string& path, int nrows, int ncols,
   return true;
 }
 
+// 单次求解样例的主流程：加载数据、拷贝到 GPU、执行 cuDSS 三阶段并回收结果
 template <typename ComplexT>
 int run_example(const ExampleInput& input) {
   using Traits = PrecisionTraits<ComplexT>;
@@ -269,6 +283,7 @@ int run_example(const ExampleInput& input) {
   double factor_ms = 0.0;
   double solve_ms = 0.0;
 
+  // RAII 风格的清理函数，任何错误返回都会触发资源释放
   auto cleanup = [&]() {
     if (A) {
       cudssMatrixDestroy(A);
@@ -369,6 +384,7 @@ int run_example(const ExampleInput& input) {
     std::ifstream matrix_stream(input.matrix_path);
     if (matrix_stream.good()) {
       matrix_stream.close();
+      // 读取外部 Matrix Market 稀疏矩阵，支持从命令行指定视图与 RHS
       matrix_market::MatrixMetadata metadata;
       matrix_market::MatrixReadOptions options;
       options.requested_view = CUDSS_MVIEW_FULL;
@@ -452,6 +468,7 @@ int run_example(const ExampleInput& input) {
   }
 
   if (!loaded_from_file) {
+    // 未提供外部文件时，构造一个 5x5 对称正定矩阵及对应 RHS 用于示例演示
     n = 5;
     nnz = 8;
     nrhs = 1;
@@ -490,6 +507,7 @@ int run_example(const ExampleInput& input) {
     }
   }
 
+  // === 设备端资源分配与数据拷贝 ===
   CUDA_CALL_AND_CHECK(
       cudaMalloc(&csr_offsets_d, static_cast<size_t>(n + 1) * sizeof(int)),
       "cudaMalloc csr_offsets");
@@ -528,11 +546,13 @@ int run_example(const ExampleInput& input) {
                  static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
       "cudaMemset x_values");
 
+  // 创建独立的 CUDA stream 与事件，用于测量各阶段耗时
   CUDA_CALL_AND_CHECK(cudaStreamCreate(&stream), "cudaStreamCreate");
 
   CUDA_CALL_AND_CHECK(cudaEventCreate(&event_start), "cudaEventCreate (start)");
   CUDA_CALL_AND_CHECK(cudaEventCreate(&event_stop), "cudaEventCreate (stop)");
 
+  // === cuDSS 句柄与矩阵描述子的初始化 ===
   CUDSS_CALL_AND_CHECK(cudssCreate(&handle), "cudssCreate");
   CUDSS_CALL_AND_CHECK(cudssSetStream(handle, stream), "cudssSetStream");
   CUDSS_CALL_AND_CHECK(cudssConfigCreate(&solver_config), "cudssConfigCreate");
@@ -560,6 +580,7 @@ int run_example(const ExampleInput& input) {
                            Traits::kCudaType, matrix_type, matrix_view, base),
       "cudssMatrixCreateCsr");
 
+  // === cuDSS 三阶段求解：分析 / 分解 / 求解，并采集耗时 ===
   CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
                       "cudaEventRecord (analysis start)");
   CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, solver_config,
@@ -609,6 +630,7 @@ int run_example(const ExampleInput& input) {
     solve_ms = static_cast<double>(elapsed_ms);
   }
 
+  // 等待所有 GPU 任务完成，随后将解向量拷贝回主机
   CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
   CUDA_CALL_AND_CHECK(
@@ -626,6 +648,7 @@ int run_example(const ExampleInput& input) {
   bool passed = true;
 
   if (loaded_from_file) {
+    // 使用读入的稀疏矩阵进行残差验证，确认 Ax ≈ b
     double residual = compute_complex_residual_norm<ComplexT>(
         n, csr_offsets_h, csr_columns_h, csr_values_h, x_values_h, b_values_h,
         matrix_view, matrix_is_hermitian);
@@ -634,6 +657,7 @@ int run_example(const ExampleInput& input) {
       passed = false;
     }
 
+    // 若存在黄金解文件，进一步打印与黄金解之间的绝对/相对误差
     std::string golden_path = make_golden_solution_path(input.matrix_path);
     if (!golden_path.empty()) {
       std::ifstream golden_stream(golden_path.c_str());
@@ -658,6 +682,7 @@ int run_example(const ExampleInput& input) {
       }
     }
   } else {
+    // 内置测试数据下，直接对比期望向量 (1,2,3,4,5)
     for (int i = 0; i < n; ++i) {
       double xr = Traits::real(x_values_h[i]);
       double xi = Traits::imag(x_values_h[i]);
@@ -697,13 +722,12 @@ int run_example(const ExampleInput& input) {
 
 }  // namespace
 
-/*
-运行命令： ./simple_complex_example -s
-../cfm56-case/A_1762995034677701_3_matrix.mtx
-../cfm56-case/A_1762995034677701_3_rhs.mtx
-其中：-s表示使用单精度复数（complex64），-d表示使用双精度复数（complex128）
-注意：goden后缀为_golden_sol.mtx
-*/
+//
+// 终端示例：
+//   ./simple_complex_example -d ../cfm56-case/A_1762995034677701_3_matrix.mtx \
+//       ../cfm56-case/A_1762995034677701_3_rhs.mtx
+//   其中 -s / -d 控制单精度（complex64）或双精度（complex128）求解；
+//   当提供 matrix.mtx 时，程序会自动寻找同名 *_golden_sol.mtx 进行对比。
 int main(int argc, char* argv[]) {
   printf("---------------------------------------------------------\n");
   printf(
