@@ -23,6 +23,7 @@
 #include <stdlib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -282,6 +283,14 @@ int run_example(const ExampleInput& input) {
   double analysis_ms = 0.0;
   double factor_ms = 0.0;
   double solve_ms = 0.0;
+  double allocation_ms = 0.0;
+  double copy_ms = 0.0;
+
+  using Clock = std::chrono::steady_clock;
+  auto measure_elapsed_ms = [](const Clock::time_point& start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start)
+        .count();
+  };
 
   // RAII 风格的清理函数，任何错误返回都会触发资源释放
   auto cleanup = [&]() {
@@ -508,43 +517,83 @@ int run_example(const ExampleInput& input) {
   }
 
   // === 设备端资源分配与数据拷贝 ===
-  CUDA_CALL_AND_CHECK(
-      cudaMalloc(&csr_offsets_d, static_cast<size_t>(n + 1) * sizeof(int)),
-      "cudaMalloc csr_offsets");
-  CUDA_CALL_AND_CHECK(
-      cudaMalloc(&csr_columns_d, static_cast<size_t>(nnz) * sizeof(int)),
-      "cudaMalloc csr_columns");
-  CUDA_CALL_AND_CHECK(
-      cudaMalloc(&csr_values_d, static_cast<size_t>(nnz) * sizeof(ComplexT)),
-      "cudaMalloc csr_values");
-  CUDA_CALL_AND_CHECK(
-      cudaMalloc(&b_values_d, static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
-      "cudaMalloc b_values");
-  CUDA_CALL_AND_CHECK(
-      cudaMalloc(&x_values_d, static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
-      "cudaMalloc x_values");
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(
+        cudaMalloc(&csr_offsets_d, static_cast<size_t>(n + 1) * sizeof(int)),
+        "cudaMalloc csr_offsets");
+    allocation_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(
+        cudaMalloc(&csr_columns_d, static_cast<size_t>(nnz) * sizeof(int)),
+        "cudaMalloc csr_columns");
+    allocation_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(
+        cudaMalloc(&csr_values_d, static_cast<size_t>(nnz) * sizeof(ComplexT)),
+        "cudaMalloc csr_values");
+    allocation_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(cudaMalloc(&b_values_d, static_cast<size_t>(nrhs) * n *
+                                                    sizeof(ComplexT)),
+                        "cudaMalloc b_values");
+    allocation_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(cudaMalloc(&x_values_d, static_cast<size_t>(nrhs) * n *
+                                                    sizeof(ComplexT)),
+                        "cudaMalloc x_values");
+    allocation_ms += measure_elapsed_ms(start);
+  }
 
-  CUDA_CALL_AND_CHECK(cudaMemcpy(csr_offsets_d, csr_offsets_h,
-                                 static_cast<size_t>(n + 1) * sizeof(int),
-                                 cudaMemcpyHostToDevice),
-                      "cudaMemcpy csr_offsets");
-  CUDA_CALL_AND_CHECK(cudaMemcpy(csr_columns_d, csr_columns_h,
-                                 static_cast<size_t>(nnz) * sizeof(int),
-                                 cudaMemcpyHostToDevice),
-                      "cudaMemcpy csr_columns");
-  CUDA_CALL_AND_CHECK(cudaMemcpy(csr_values_d, csr_values_h,
-                                 static_cast<size_t>(nnz) * sizeof(ComplexT),
-                                 cudaMemcpyHostToDevice),
-                      "cudaMemcpy csr_values");
-  CUDA_CALL_AND_CHECK(
-      cudaMemcpy(b_values_d, b_values_h,
-                 static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
-                 cudaMemcpyHostToDevice),
-      "cudaMemcpy b_values");
-  CUDA_CALL_AND_CHECK(
-      cudaMemset(x_values_d, 0,
-                 static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
-      "cudaMemset x_values");
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(cudaMemcpy(csr_offsets_d, csr_offsets_h,
+                                   static_cast<size_t>(n + 1) * sizeof(int),
+                                   cudaMemcpyHostToDevice),
+                        "cudaMemcpy csr_offsets");
+    copy_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(cudaMemcpy(csr_columns_d, csr_columns_h,
+                                   static_cast<size_t>(nnz) * sizeof(int),
+                                   cudaMemcpyHostToDevice),
+                        "cudaMemcpy csr_columns");
+    copy_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(cudaMemcpy(csr_values_d, csr_values_h,
+                                   static_cast<size_t>(nnz) * sizeof(ComplexT),
+                                   cudaMemcpyHostToDevice),
+                        "cudaMemcpy csr_values");
+    copy_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(
+        cudaMemcpy(b_values_d, b_values_h,
+                   static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
+                   cudaMemcpyHostToDevice),
+        "cudaMemcpy b_values");
+    copy_ms += measure_elapsed_ms(start);
+  }
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(
+        cudaMemset(x_values_d, 0,
+                   static_cast<size_t>(nrhs) * n * sizeof(ComplexT)),
+        "cudaMemset x_values");
+    copy_ms += measure_elapsed_ms(start);
+  }
 
   // 创建独立的 CUDA stream 与事件，用于测量各阶段耗时
   CUDA_CALL_AND_CHECK(cudaStreamCreate(&stream), "cudaStreamCreate");
@@ -633,11 +682,15 @@ int run_example(const ExampleInput& input) {
   // 等待所有 GPU 任务完成，随后将解向量拷贝回主机
   CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
-  CUDA_CALL_AND_CHECK(
-      cudaMemcpy(x_values_h, x_values_d,
-                 static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
-                 cudaMemcpyDeviceToHost),
-      "cudaMemcpy x_values");
+  {
+    Clock::time_point start = Clock::now();
+    CUDA_CALL_AND_CHECK(
+        cudaMemcpy(x_values_h, x_values_d,
+                   static_cast<size_t>(nrhs) * n * sizeof(ComplexT),
+                   cudaMemcpyDeviceToHost),
+        "cudaMemcpy x_values");
+    copy_ms += measure_elapsed_ms(start);
+  }
 
   printf("Precision: %s\n", Traits::kName);
   double total_ms = analysis_ms + factor_ms + solve_ms;
@@ -645,6 +698,8 @@ int run_example(const ExampleInput& input) {
       "Timing (ms): analysis=%0.3f, factorization=%0.3f, solve=%0.3f, "
       "total=%0.3f\n",
       analysis_ms, factor_ms, solve_ms, total_ms);
+  printf("Resource timing (ms): allocation=%0.3f, copy=%0.3f\n", allocation_ms,
+         copy_ms);
   bool passed = true;
 
   if (loaded_from_file) {
