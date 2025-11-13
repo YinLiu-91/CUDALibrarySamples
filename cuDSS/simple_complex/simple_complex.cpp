@@ -714,6 +714,7 @@ int run_example(const ExampleInput& input) {
 
     // 若存在黄金解文件，进一步打印与黄金解之间的绝对/相对误差
     std::string golden_path = make_golden_solution_path(input.matrix_path);
+    printf("Looking for golden solution file at: %s\n", golden_path.c_str());
     if (!golden_path.empty()) {
       std::ifstream golden_stream(golden_path.c_str());
       if (golden_stream.good()) {
