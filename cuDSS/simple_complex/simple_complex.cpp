@@ -702,6 +702,7 @@ int run_example(const ExampleInput& input) {
 ../cfm56-case/A_1762995034677701_3_matrix.mtx
 ../cfm56-case/A_1762995034677701_3_rhs.mtx
 其中：-s表示使用单精度复数（complex64），-d表示使用双精度复数（complex128）
+注意：goden后缀为_golden_sol.mtx
 */
 int main(int argc, char* argv[]) {
   printf("---------------------------------------------------------\n");
