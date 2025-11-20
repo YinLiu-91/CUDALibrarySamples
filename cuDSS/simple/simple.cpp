@@ -18,6 +18,9 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include <stdint.h>
 #include <math.h>
 #include <assert.h>
 #include <cuda_runtime.h>
@@ -69,18 +72,91 @@
         } \
     } while(0);
 
+static bool parse_arg_value(const char *name, const char *text, int min_value, int *out_value) {
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (end == text || *end != '\0') {
+        fprintf(stderr, "Error: %s expects an integer, got '%s'\n", name, text);
+        return false;
+    }
+    if (parsed < min_value) {
+        fprintf(stderr, "Error: %s must be >= %d\n", name, min_value);
+        return false;
+    }
+    if (parsed > INT_MAX) {
+        fprintf(stderr, "Error: %s exceeds INT_MAX\n", name);
+        return false;
+    }
+    *out_value = (int)parsed;
+    return true;
+}
+
+static int64_t compute_upper_band_nnz(int n, int bandwidth) {
+    if (bandwidth < 0) {
+        bandwidth = 0;
+    }
+    int64_t total = 0;
+    for (int row = 0; row < n; ++row) {
+        int max_col = row + bandwidth;
+        if (max_col >= n) {
+            max_col = n - 1;
+        }
+        total += (max_col - row + 1);
+    }
+    return total;
+}
+
 
 int main (int argc, char *argv[]) {
     printf("---------------------------------------------------------\n");
-    printf("cuDSS example: solving a real linear 5x5 system\n"
-           "with a symmetric positive-definite matrix \n");
+    printf("cuDSS example: solving a real linear system\n"
+           "with a configurable banded SPD matrix\n");
     printf("---------------------------------------------------------\n");
+
+    if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+            printf("Usage: %s [n] [bandwidth]\n", argv[0]);
+            printf("       n         : matrix dimension (default 5)\n");
+            printf("       bandwidth : number of super-diagonals to keep (default 2)\n");
+        return 0;
+    }
+
     cudaError_t cuda_error = cudaSuccess;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
 
     int n = 5;
-    int nnz = 8;
+    int bandwidth = 2;
     int nrhs = 1;
+
+    if (argc > 1) {
+        if (!parse_arg_value("n", argv[1], 1, &n)) {
+            return -1;
+        }
+    }
+    if (argc > 2) {
+        if (!parse_arg_value("bandwidth", argv[2], 0, &bandwidth)) {
+            return -1;
+        }
+    }
+    if (argc > 3) {
+        printf("Warning: ignoring %d extra argument(s) starting with '%s'\n", argc - 3, argv[3]);
+    }
+
+    if (bandwidth >= n) {
+        int clamped = (n > 0) ? (n - 1) : 0;
+        if (bandwidth != clamped) {
+            printf("Info: bandwidth %d truncated to %d for n=%d\n", bandwidth, clamped, n);
+        }
+        bandwidth = clamped;
+    }
+
+    int64_t max_band_nnz = compute_upper_band_nnz(n, bandwidth);
+    if (max_band_nnz > INT_MAX) {
+        fprintf(stderr, "Error: matrix too large (nnz=%lld exceeds INT_MAX)\n", (long long)max_band_nnz);
+        return -1;
+    }
+    int nnz = (int)max_band_nnz;
+
+    printf("Matrix configuration => n=%d, bandwidth=%d, stored nnz=%d\n", n, bandwidth, nnz);
 
     int *csr_offsets_h = NULL;
     int *csr_columns_h = NULL;
@@ -107,37 +183,45 @@ int main (int argc, char *argv[]) {
         return -1;
     }
 
-    /* Initialize host memory for A and b */
-    int i = 0;
-    csr_offsets_h[i++] = 0;
-    csr_offsets_h[i++] = 2;
-    csr_offsets_h[i++] = 4;
-    csr_offsets_h[i++] = 6;
-    csr_offsets_h[i++] = 7;
-    csr_offsets_h[i++] = 8;
+    /* Initialize host memory for A and b using a banded SPD matrix */
+    for (int idx = 0; idx < nrhs * n; ++idx) {
+        x_values_h[idx] = 0.0;
+        b_values_h[idx] = 0.0;
+    }
 
-    i = 0;
-    csr_columns_h[i++] = 0; csr_columns_h[i++] = 2;
-    csr_columns_h[i++] = 1; csr_columns_h[i++] = 2;
-    csr_columns_h[i++] = 2; csr_columns_h[i++] = 4;
-    csr_columns_h[i++] = 3;
-    csr_columns_h[i++] = 4;
+    const double diag_value = 2.0 * (bandwidth + 1);
+    int values_written = 0;
+    for (int row = 0; row < n; ++row) {
+        csr_offsets_h[row] = values_written;
+        csr_columns_h[values_written] = row;
+        csr_values_h[values_written] = diag_value;
+        ++values_written;
 
-    i = 0;
-    csr_values_h[i++] = 4.0; csr_values_h[i++] = 1.0;
-    csr_values_h[i++] = 3.0; csr_values_h[i++] = 2.0;
-    csr_values_h[i++] = 5.0; csr_values_h[i++] = 1.0;
-    csr_values_h[i++] = 1.0;
-    csr_values_h[i++] = 2.0;
+        for (int offset = 1; offset <= bandwidth; ++offset) {
+            int col = row + offset;
+            if (col >= n) {
+                break;
+            }
+            csr_columns_h[values_written] = col;
+            csr_values_h[values_written] = 1.0;
+            ++values_written;
+        }
+    }
+    csr_offsets_h[n] = values_written;
+    assert(values_written == nnz);
 
-    /* Note: Right-hand side b is initialized with values which correspond
-       to the exact solution vector {1, 2, 3, 4, 5} */
-    i = 0;
-    b_values_h[i++] = 7.0;
-    b_values_h[i++] = 12.0;
-    b_values_h[i++] = 25.0;
-    b_values_h[i++] = 4.0;
-    b_values_h[i++] = 13.0;
+    /* Construct RHS corresponding to the exact solution vector {1, 2, ..., n} */
+    for (int row = 0; row < n; ++row) {
+        for (int idx = csr_offsets_h[row]; idx < csr_offsets_h[row + 1]; ++idx) {
+            int col = csr_columns_h[idx];
+            double val = csr_values_h[idx];
+            double x_col = double(col + 1);
+            b_values_h[row] += val * x_col;
+            if (col != row) {
+                b_values_h[col] += val * double(row + 1);
+            }
+        }
+    }
 
     /* Allocate device memory for A, x and b */
     CUDA_CALL_AND_CHECK(cudaMalloc(&csr_offsets_d, (n + 1) * sizeof(int)),
@@ -225,10 +309,11 @@ int main (int argc, char *argv[]) {
     CUDA_CALL_AND_CHECK(cudaMemcpy(x_values_h, x_values_d, nrhs * n * sizeof(double),
                         cudaMemcpyDeviceToHost), "cudaMemcpy for x_values");
 
+    const double kSolutionTolerance = 1e-9;
     int passed = 1;
     for (int i = 0; i < n; i++) {
         printf("x[%d] = %1.4f expected %1.4f\n", i, x_values_h[i], double(i+1));
-        if (fabs(x_values_h[i] - (i + 1)) > 2.e-15)
+        if (fabs(x_values_h[i] - (i + 1)) > kSolutionTolerance)
           passed = 0;
     }
 
