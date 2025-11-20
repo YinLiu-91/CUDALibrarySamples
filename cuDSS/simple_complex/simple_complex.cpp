@@ -246,7 +246,7 @@ bool write_solution_matrix_market(const std::string& path, int nrows, int ncols,
 
 // 单次求解样例的主流程：加载数据、拷贝到 GPU、执行 cuDSS 三阶段并回收结果
 template <typename ComplexT>
-int run_example(const ExampleInput& input) {
+int run_example(const ExampleInput& input, const bool use_MT = false) {
   using Traits = PrecisionTraits<ComplexT>;
 
   int n = 0;
@@ -601,6 +601,18 @@ int run_example(const ExampleInput& input) {
   CUDA_CALL_AND_CHECK(cudaEventCreate(&event_start), "cudaEventCreate (start)");
   CUDA_CALL_AND_CHECK(cudaEventCreate(&event_stop), "cudaEventCreate (stop)");
 
+  /* Set the full name of the cuDSS threading layer library.
+  Note: if threading_layer_libname = NULL then cudssSetThreadingLayer takes
+  the threading layer library name from the environment variable
+  "CUDSS_THREADING_LIB"*/
+  if (use_MT) {
+    printf("use MT mode\n");
+#if USE_OPENMP
+    CUDSS_CALL_AND_CHECK(cudssSetThreadingLayer(handle, NULL),
+                         "cudssSetThreadingLayer");
+#endif
+  }
+
   // === cuDSS 句柄与矩阵描述子的初始化 ===
   CUDSS_CALL_AND_CHECK(cudssCreate(&handle), "cudssCreate");
   CUDSS_CALL_AND_CHECK(cudssSetStream(handle, stream), "cudssSetStream");
@@ -780,8 +792,11 @@ int run_example(const ExampleInput& input) {
 
 //
 // 终端示例：
-//   ./simple_complex_example -d ../cfm56-case/A_1762995034677701_3_matrix.mtx \
-//       ../cfm56-case/A_1762995034677701_3_rhs.mtx
+/*
+./simple_complex_example_gomp  -d \
+../cfm56-case/A_1762995034677701_3_matrix_1.mtx \
+../cfm56-case/A_1762995034677701_3_rhs.mtx
+*/
 //   其中 -s / -d 控制单精度（complex64）或双精度（complex128）求解；
 //   当提供 matrix.mtx 时，程序会自动寻找同名 *_golden_sol.mtx 进行对比。
 int main(int argc, char* argv[]) {
@@ -798,6 +813,7 @@ int main(int argc, char* argv[]) {
   PrecisionMode precision = PrecisionMode::kComplex64;
 
   int index = 1;
+  bool use_MT = false;
   while (index < argc) {
     const char* arg = argv[index];
     if (std::strncmp(arg, "--precision=", 12) == 0) {
@@ -817,6 +833,10 @@ int main(int argc, char* argv[]) {
                std::strcmp(arg, "--float") == 0 ||
                std::strcmp(arg, "-s") == 0) {
       precision = PrecisionMode::kComplex64;
+      ++index;
+    } else if (std::strcmp(arg, "--use_MT") == 0 ||
+               std::strcmp(arg, "--MT") == 0) {
+      use_MT = true;
       ++index;
     } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
       printf("Usage: %s [--precision=single|double] [matrix.mtx [rhs.mtx]]\n",
@@ -842,8 +862,8 @@ int main(int argc, char* argv[]) {
   }
 
   if (precision == PrecisionMode::kComplex128) {
-    return run_example<cuDoubleComplex>(input);
+    return run_example<cuDoubleComplex>(input, use_MT);
   }
 
-  return run_example<cuComplex>(input);
+  return run_example<cuComplex>(input, use_MT);
 }
