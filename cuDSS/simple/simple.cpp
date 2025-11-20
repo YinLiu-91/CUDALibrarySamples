@@ -129,7 +129,7 @@ int main (int argc, char *argv[]) {
     int n = 5;
     int bandwidth = 2;
     int nrhs = 1;
-    int use_MT_tag = 0;
+    bool use_MT = false;
 
     if (argc > 1) {
         if (!parse_arg_value("n", argv[1], 1, &n)) {
@@ -143,11 +143,12 @@ int main (int argc, char *argv[]) {
     }
 
     if (argc > 3) {
-      if (!parse_arg_value("use_MT_tag", argv[3], 0, &use_MT_tag)) {
-        return -1;
-      }
+        int use_mt_flag = 0;
+        if (!parse_arg_value("use_MT", argv[3], 0, &use_mt_flag)) {
+            return -1;
+        }
+        use_MT = (use_mt_flag != 0);
     }
-    bool use_MT = (bool)use_MT_tag;
 
     if (argc > 4) {
       printf("Warning: ignoring %d extra argument(s) starting with '%s'\n",
@@ -260,7 +261,11 @@ int main (int argc, char *argv[]) {
 
     /* Create a CUDA stream */
     cudaStream_t stream = NULL;
+    cudaEvent_t event_start = NULL;
+    cudaEvent_t event_stop = NULL;
     CUDA_CALL_AND_CHECK(cudaStreamCreate(&stream), "cudaStreamCreate");
+    CUDA_CALL_AND_CHECK(cudaEventCreate(&event_start), "cudaEventCreate start");
+    CUDA_CALL_AND_CHECK(cudaEventCreate(&event_stop), "cudaEventCreate stop");
 
     /* Creating the cuDSS library handle */
     cudssHandle_t handle;
@@ -309,17 +314,43 @@ int main (int argc, char *argv[]) {
                          csr_columns_d, csr_values_d, CUDA_R_32I, CUDA_R_64F, mtype, mview,
                          base), status, "cudssMatrixCreateCsr");
 
+    float analysis_ms = 0.0f;
+    float factor_ms = 0.0f;
+    float solve_ms = 0.0f;
+
     /* Symbolic factorization */
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream), "cudaEventRecord analysis start");
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, solverConfig, solverData,
-                         A, x, b), status, "cudssExecute for analysis");
+                A, x, b), status, "cudssExecute for analysis");
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream), "cudaEventRecord analysis stop");
+    CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop), "cudaEventSynchronize analysis");
+    CUDA_CALL_AND_CHECK(cudaEventElapsedTime(&analysis_ms, event_start, event_stop),
+               "cudaEventElapsedTime analysis");
 
     /* Factorization */
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream), "cudaEventRecord factor start");
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_FACTORIZATION, solverConfig,
-                         solverData, A, x, b), status, "cudssExecute for factor");
+                solverData, A, x, b), status, "cudssExecute for factor");
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream), "cudaEventRecord factor stop");
+    CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop), "cudaEventSynchronize factor");
+    CUDA_CALL_AND_CHECK(cudaEventElapsedTime(&factor_ms, event_start, event_stop),
+               "cudaEventElapsedTime factor");
 
     /* Solving */
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream), "cudaEventRecord solve start");
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_SOLVE, solverConfig, solverData,
-                         A, x, b), status, "cudssExecute for solve");
+                A, x, b), status, "cudssExecute for solve");
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream), "cudaEventRecord solve stop");
+    CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop), "cudaEventSynchronize solve");
+    CUDA_CALL_AND_CHECK(cudaEventElapsedTime(&solve_ms, event_start, event_stop),
+               "cudaEventElapsedTime solve");
+
+    double total_ms = static_cast<double>(analysis_ms + factor_ms + solve_ms);
+    printf("Timing summary (ms): analysis=%.3f, factorization=%.3f, solve=%.3f, total=%.3f\n",
+        analysis_ms, factor_ms, solve_ms, total_ms);
+
+    CUDA_CALL_AND_CHECK(cudaEventDestroy(event_start), "cudaEventDestroy start");
+    CUDA_CALL_AND_CHECK(cudaEventDestroy(event_stop), "cudaEventDestroy stop");
 
     /* Destroying opaque objects, matrix wrappers and the cuDSS library handle */
     CUDSS_CALL_AND_CHECK(cudssMatrixDestroy(A), status, "cudssMatrixDestroy for A");
