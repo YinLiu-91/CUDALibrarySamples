@@ -106,7 +106,10 @@ static int64_t compute_upper_band_nnz(int n, int bandwidth) {
     return total;
 }
 
-
+/*
+CUDSS_THREADING_LIB=/usr/lib/x86_64-linux-gnu/libcudss_mtlayer_gomp.so
+./simple_example_gomp 100000 20 1 args为 n, bandwidth, use_MT_tag
+*/
 int main (int argc, char *argv[]) {
     printf("---------------------------------------------------------\n");
     printf("cuDSS example: solving a real linear system\n"
@@ -126,6 +129,7 @@ int main (int argc, char *argv[]) {
     int n = 5;
     int bandwidth = 2;
     int nrhs = 1;
+    int use_MT_tag = 0;
 
     if (argc > 1) {
         if (!parse_arg_value("n", argv[1], 1, &n)) {
@@ -137,8 +141,17 @@ int main (int argc, char *argv[]) {
             return -1;
         }
     }
+
     if (argc > 3) {
-        printf("Warning: ignoring %d extra argument(s) starting with '%s'\n", argc - 3, argv[3]);
+      if (!parse_arg_value("use_MT_tag", argv[3], 0, &use_MT_tag)) {
+        return -1;
+      }
+    }
+    bool use_MT = (bool)use_MT_tag;
+
+    if (argc > 4) {
+      printf("Warning: ignoring %d extra argument(s) starting with '%s'\n",
+             argc - 4, argv[4]);
     }
 
     if (bandwidth >= n) {
@@ -261,8 +274,9 @@ int main (int argc, char *argv[]) {
   Note: if threading_layer_libname = NULL then cudssSetThreadingLayer takes
   the threading layer library name from the environment variable
   "CUDSS_THREADING_LIB"*/
-    bool use_MT = false;
+    // bool use_MT = false;
     if (use_MT) {
+      printf("use MT mode\n");
 #if USE_OPENMP
       CUDSS_CALL_AND_CHECK(cudssSetThreadingLayer(handle, NULL), status,
                            "cudssSetThreadingLayer");
@@ -324,9 +338,9 @@ int main (int argc, char *argv[]) {
     const double kSolutionTolerance = 1e-9;
     int passed = 1;
     for (int i = 0; i < n; i++) {
-        printf("x[%d] = %1.4f expected %1.4f\n", i, x_values_h[i], double(i+1));
-        if (fabs(x_values_h[i] - (i + 1)) > kSolutionTolerance)
-          passed = 0;
+      // printf("x[%d] = %1.4f expected %1.4f\n", i, x_values_h[i],
+      // double(i+1));
+      if (fabs(x_values_h[i] - (i + 1)) > kSolutionTolerance) passed = 0;
     }
 
     /* Release the data allocated on the user side */
