@@ -257,6 +257,18 @@ int main (int argc, char *argv[]) {
     /* (optional) Setting the custom stream for the library handle */
     CUDSS_CALL_AND_CHECK(cudssSetStream(handle, stream), status, "cudssSetStream");
 
+    /* Set the full name of the cuDSS threading layer library.
+  Note: if threading_layer_libname = NULL then cudssSetThreadingLayer takes
+  the threading layer library name from the environment variable
+  "CUDSS_THREADING_LIB"*/
+    bool use_MT = false;
+    if (use_MT) {
+#if USE_OPENMP
+      CUDSS_CALL_AND_CHECK(cudssSetThreadingLayer(handle, NULL), status,
+                           "cudssSetThreadingLayer");
+#endif
+    }
+
     /* Creating cuDSS solver configuration and data objects */
     cudssConfig_t solverConfig;
     cudssData_t solverData;
