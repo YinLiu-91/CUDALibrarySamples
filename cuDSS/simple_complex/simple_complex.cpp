@@ -601,10 +601,15 @@ int run_example(const ExampleInput& input, const bool use_MT = false) {
   CUDA_CALL_AND_CHECK(cudaEventCreate(&event_start), "cudaEventCreate (start)");
   CUDA_CALL_AND_CHECK(cudaEventCreate(&event_stop), "cudaEventCreate (stop)");
 
+  // === cuDSS 句柄与矩阵描述子的初始化 ===
+  CUDSS_CALL_AND_CHECK(cudssCreate(&handle), "cudssCreate");
+  CUDSS_CALL_AND_CHECK(cudssSetStream(handle, stream), "cudssSetStream");
+
+  // 放在set setsream之后
   /* Set the full name of the cuDSS threading layer library.
-  Note: if threading_layer_libname = NULL then cudssSetThreadingLayer takes
-  the threading layer library name from the environment variable
-  "CUDSS_THREADING_LIB"*/
+Note: if threading_layer_libname = NULL then cudssSetThreadingLayer takes
+the threading layer library name from the environment variable
+"CUDSS_THREADING_LIB"*/
   if (use_MT) {
     printf("use MT mode\n");
 #if USE_OPENMP
@@ -613,9 +618,6 @@ int run_example(const ExampleInput& input, const bool use_MT = false) {
 #endif
   }
 
-  // === cuDSS 句柄与矩阵描述子的初始化 ===
-  CUDSS_CALL_AND_CHECK(cudssCreate(&handle), "cudssCreate");
-  CUDSS_CALL_AND_CHECK(cudssSetStream(handle, stream), "cudssSetStream");
   CUDSS_CALL_AND_CHECK(cudssConfigCreate(&solver_config), "cudssConfigCreate");
   CUDSS_CALL_AND_CHECK(cudssDataCreate(handle, &solver_data),
                        "cudssDataCreate");
@@ -793,12 +795,14 @@ int run_example(const ExampleInput& input, const bool use_MT = false) {
 //
 // 终端示例：
 /*
+CUDSS_THREADING_LIB=/usr/lib/x86_64-linux-gnu/libcudss_mtlayer_gomp.so \
 ./simple_complex_example_gomp  -d \
 ../cfm56-case/A_1762995034677701_3_matrix_1.mtx \
-../cfm56-case/A_1762995034677701_3_rhs.mtx
+../cfm56-case/A_1762995034677701_3_rhs.mtx --use_MT
 */
 //   其中 -s / -d 控制单精度（complex64）或双精度（complex128）求解；
 //   当提供 matrix.mtx 时，程序会自动寻找同名 *_golden_sol.mtx 进行对比。
+// use_MT表示reordering是否启用多线程
 int main(int argc, char* argv[]) {
   printf("---------------------------------------------------------\n");
   printf(
@@ -813,7 +817,7 @@ int main(int argc, char* argv[]) {
   PrecisionMode precision = PrecisionMode::kComplex64;
 
   int index = 1;
-  bool use_MT = false;
+  bool use_MT = true;
   while (index < argc) {
     const char* arg = argv[index];
     if (std::strncmp(arg, "--precision=", 12) == 0) {
