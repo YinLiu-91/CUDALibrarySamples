@@ -22,8 +22,11 @@
 #include <math.h>
 #include <assert.h>
 #include <cuda_runtime.h>
+#include <vector>
+#include <algorithm>
 
 #include "cudss.h"
+#include "../simple_matrix_market/matrix_market_reader.h"
 
 #ifdef USE_MPI
 #  include "mpi.h"
@@ -112,6 +115,49 @@
         } \
     } while(0);
 
+// Helper function to extract local CSR data for a rank from global matrix
+void extract_local_csr(int n_global, int *csr_offsets_global, int *csr_columns_global, 
+                       double *csr_values_global, int row_start, int row_end,
+                       int **csr_offsets_local, int **csr_columns_local, 
+                       double **csr_values_local, int *local_nnz) {
+    int local_n = row_end - row_start + 1;
+    if (local_n <= 0) {
+        *csr_offsets_local = NULL;
+        *csr_columns_local = NULL;
+        *csr_values_local = NULL;
+        *local_nnz = 0;
+        return;
+    }
+    
+    // Count local nnz
+    *local_nnz = 0;
+    for (int i = row_start; i <= row_end; i++) {
+        *local_nnz += csr_offsets_global[i + 1] - csr_offsets_global[i];
+    }
+    
+    // Allocate local memory
+    *csr_offsets_local = (int*)malloc((local_n + 1) * sizeof(int));
+    *csr_columns_local = (int*)malloc(*local_nnz * sizeof(int));
+    *csr_values_local = (double*)malloc(*local_nnz * sizeof(double));
+    
+    // Extract local data
+    int local_idx = 0;
+    (*csr_offsets_local)[0] = 0;
+    for (int i = 0; i < local_n; i++) {
+        int global_row = row_start + i;
+        int row_start_idx = csr_offsets_global[global_row];
+        int row_end_idx = csr_offsets_global[global_row + 1];
+        int row_nnz = row_end_idx - row_start_idx;
+        
+        for (int j = 0; j < row_nnz; j++) {
+            (*csr_columns_local)[local_idx] = csr_columns_global[row_start_idx + j];
+            (*csr_values_local)[local_idx] = csr_values_global[row_start_idx + j];
+            local_idx++;
+        }
+        (*csr_offsets_local)[i + 1] = local_idx;
+    }
+}
+
 
 int main (int argc, char *argv[]) {
     cudaError_t   cuda_error = cudaSuccess;
@@ -147,9 +193,10 @@ int main (int argc, char *argv[]) {
         printf("Note: number of processes must not exceed the number of\n"
                "GPU devices available\n");
         printf("---------------------------------------------------------\n");
-        printf("cuDSS example: solving a real linear 5x5 system\n"
+        printf("cuDSS example: solving a real linear system\n"
                "with a distributed symmetric positive-definite matrix using \n"
                "the MGMN mode.\n");
+        printf("Matrix will be read from file and distributed among ranks.\n");
         printf("---------------------------------------------------------\n");
         fflush(0);
     }
@@ -169,31 +216,26 @@ int main (int argc, char *argv[]) {
     int device_id = rank % device_count;
     CUDA_CALL_AND_CHECK(cudaSetDevice(device_id), "cudaSetDevice");
 
+    /*timers*/
+    cudaEvent_t start, stop;
+    float time_ms = 0.0f, total_ms = 0.0f;
+    // Create CUDA events
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
     /* Parsing the communication layer information from the input parameters */
     char comm_backend_name[1024];
     char comm_layer_libname[1024];
-    if (argc > 2) {
-        strncpy(comm_backend_name, argv[1], sizeof(comm_backend_name));
-        if (rank == 0) printf("Communication backend name is: %s\n", comm_backend_name);
-        strncpy(comm_layer_libname, argv[2], sizeof(comm_layer_libname));
-        printf("Communication layer library name is: %s\n", comm_layer_libname);
-        fflush(0);
-    } else if (argc == 2) {
-        strncpy(comm_backend_name, argv[1], sizeof(comm_backend_name));
-        if (rank == 0) printf("Communication backend name is: %s\n", comm_backend_name);
-        if (rank == 0)
-            printf("Since communication layer library name was not provided as input \n"
-                    "argument for the executable, the layer library name will be \n"
-                    "taken from CUDSS_COMM_LIB environment variable\n");
-        fflush(0);
-    } else {
+    const char *matrix_filename = nullptr;
+    const char *vector_filename = nullptr;
+    
+    if (argc < 3) {
         if (rank == 0) {
-            printf("Error: this example requires passing at least one argument:\n"
-                    "the communication backend name (openmpi or nccl)\n"
-                    "and, optionally, the second argument for the communication \n"
-                    "layer library (full name with the path)\n"
-                    "If the second argument is not present, the layer library name will be \n"
-                    "taken from CUDSS_COMM_LIB environment variable\n"
+            printf("Error: this example requires at least 3 arguments:\n"
+                    "1. the communication backend name (openmpi or nccl)\n"
+                    "2. the communication layer library (full name with the path, or empty string to use CUDSS_COMM_LIB)\n"
+                    "3. the matrix filename (Matrix Market format)\n"
+                    "4. (optional) the right-hand side vector filename (Matrix Market format)\n"
                     "Note: backend should match the communication layer library\n");
             fflush(0);
         }
@@ -202,6 +244,33 @@ int main (int argc, char *argv[]) {
 #endif
         return -2;
     }
+    
+    strncpy(comm_backend_name, argv[1], sizeof(comm_backend_name));
+    if (rank == 0) printf("Communication backend name is: %s\n", comm_backend_name);
+    
+    if (strlen(argv[2]) > 0) {
+        strncpy(comm_layer_libname, argv[2], sizeof(comm_layer_libname));
+        if (rank == 0) printf("Communication layer library name is: %s\n", comm_layer_libname);
+    } else {
+        if (rank == 0)
+            printf("Since communication layer library name was not provided as input \n"
+                    "argument for the executable, the layer library name will be \n"
+                    "taken from CUDSS_COMM_LIB environment variable\n");
+    }
+    
+    matrix_filename = argv[3];
+    if (argc > 4) {
+        vector_filename = argv[4];
+    }
+    if (rank == 0) {
+        printf("Matrix filename: %s\n", matrix_filename);
+        if (vector_filename) {
+            printf("Vector filename: %s\n", vector_filename);
+        } else {
+            printf("No vector filename provided, will use default values\n");
+        }
+    }
+    fflush(0);
 
 
     /* Creating a communicator of the type matching the communication backend */
@@ -229,10 +298,17 @@ int main (int argc, char *argv[]) {
     #endif
 #endif
 
-    int n = 5;
-    int nnz = 8;
+    int n = 0;
+    int nnz = 0;
     int nrhs = 1;
 
+    // Global matrix data (only on rank 0)
+    int *csr_offsets_global = NULL;
+    int *csr_columns_global = NULL;
+    double *csr_values_global = NULL;
+    double *b_values_global = NULL;
+
+    // Local matrix data
     int *csr_offsets_h = NULL;
     int *csr_columns_h = NULL;
     double *csr_values_h = NULL;
@@ -248,6 +324,37 @@ int main (int argc, char *argv[]) {
     int b_row_start = 0;
     int b_row_end   = 0;
 
+    cudssMatrixType_t mtype = CUDSS_MTYPE_GENERAL;
+    cudssMatrixViewType_t mview = CUDSS_MVIEW_FULL;
+
+    /* Read input matrix from file on rank 0 */
+    if (rank == 0) {
+        printf("--- Reading matrix from file ---\n");
+        cudaEventRecord(start);
+        int failed = matrix_reader(matrix_filename, n, nnz, &csr_offsets_global,
+                                   &csr_columns_global, &csr_values_global, mview);
+        if (failed) {
+            fprintf(stderr, "Reader failed.\n");
+#ifdef USE_MPI
+            MPI_Finalize();
+#endif
+            return EXIT_FAILURE;
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&time_ms, start, stop);
+        printf("Matrix reading time: %.4f ms\n", time_ms);
+        total_ms += time_ms;
+        printf("Matrix size: %dx%d, nnz: %d\n", n, n, nnz);
+        fflush(0);
+    }
+
+    /* Broadcast global matrix size to all ranks */
+#ifdef USE_MPI
+    MPI_CALL_AND_CHECK(MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD), "MPI_Bcast for n");
+    MPI_CALL_AND_CHECK(MPI_Bcast(&nnz, 1, MPI_INT, 0, MPI_COMM_WORLD), "MPI_Bcast for nnz");
+#endif
+
     //Note that distribution of the solution can be different from the matrix
     //    and right-hand side
     //In this example we set full overlapping for the solution vector that means
@@ -259,97 +366,64 @@ int main (int argc, char *argv[]) {
         printf("Error: host memory allocation failed\n");fflush(0);
         return -2;
     }
-    /* Allocate device memory for x and b */
+    /* Allocate device memory for x */
     CUDA_CALL_AND_CHECK(cudaMalloc(&x_values_d, nrhs * n * sizeof(double)),
         "cudaMalloc for x_values");
 
-    /* We only allocate host and device memory A for rank 0 and 1*/
+    /* Distribute matrix rows among ranks */
     if (rank == 0) {
         //Matrix row start and end should be always in 0-based
+        // Simple distribution: rank 0 gets first half, rank 1 gets second half (with overlap)
         matrix_row_start = 0;
-        matrix_row_end   = size == 1 ? n - 1 : 3;
+        matrix_row_end   = size == 1 ? n - 1 : (n / 2);
 
         //Note that distribution of right-hand can be different from the matrix.
         b_row_start = 0;
-        b_row_end   = size == 1 ? n - 1 : 2;
+        b_row_end   = size == 1 ? n - 1 : (n / 2);
         int local_b_n = b_row_end - b_row_start + 1;
 
         int local_n = matrix_row_end - matrix_row_start + 1;
-        int local_nnz = size == 1 ? nnz : 5;
+        int local_nnz = 0;
 
-        /* Allocate host memory for the sparse input matrix A and right-hand b*/
-        csr_offsets_h = (int*)malloc((local_n + 1) * sizeof(int));
-        csr_columns_h = (int*)malloc(local_nnz * sizeof(int));
-        csr_values_h = (double*)malloc(local_nnz * sizeof(double));
+        /* Extract local CSR data from global matrix */
+        extract_local_csr(n, csr_offsets_global, csr_columns_global, csr_values_global,
+                         matrix_row_start, matrix_row_end,
+                         &csr_offsets_h, &csr_columns_h, &csr_values_h, &local_nnz);
 
-        if (!csr_offsets_h || ! csr_columns_h || !csr_values_h) {
+        if (!csr_offsets_h || !csr_columns_h || !csr_values_h) {
             printf("Error: host memory allocation failed\n");fflush(0);
             return -2;
         }
 
-        /* Allocate host memory for the right-hand side b*/
-        b_values_h = (double*)malloc(nrhs * local_b_n * sizeof(double));
-        if (!b_values_h) {
-            printf("Error: host memory allocation failed\n");fflush(0);
-            return -2;
-        }
-
-        /* Initialize host memory for A and b */
-        if (size == 1) {
-            int i = 0;
-            csr_offsets_h[i++] = 0;
-            csr_offsets_h[i++] = 2;
-            csr_offsets_h[i++] = 4;
-            csr_offsets_h[i++] = 6;
-            csr_offsets_h[i++] = 7;
-            csr_offsets_h[i++] = 8;
-
-            i = 0;
-            csr_columns_h[i++] = 0; csr_columns_h[i++] = 2;
-            csr_columns_h[i++] = 1; csr_columns_h[i++] = 2;
-            csr_columns_h[i++] = 2; csr_columns_h[i++] = 4;
-            csr_columns_h[i++] = 3;
-            csr_columns_h[i++] = 4;
-
-            i = 0;
-            csr_values_h[i++] = 4.0; csr_values_h[i++] = 1.0;
-            csr_values_h[i++] = 3.0; csr_values_h[i++] = 2.0;
-            csr_values_h[i++] = 5.0; csr_values_h[i++] = 1.0;
-            csr_values_h[i++] = 1.0;
-            csr_values_h[i++] = 2.0;
-
-            /* Note: Right-hand side b is initialized with values which correspond
-             * to the exact solution vector {1, 2, 3, 4, 5} */
-            i = 0;
-            b_values_h[i++] = 7.0;
-            b_values_h[i++] = 12.0;
-            b_values_h[i++] = 25.0;
-            b_values_h[i++] = 4.0;
-            b_values_h[i++] = 13.0;
+        /* Read or allocate right-hand side b */
+        if (vector_filename != nullptr) {
+            int failed = rhs_reader(vector_filename, n, &b_values_global);
+            if (failed) {
+                fprintf(stderr, "RHS reader failed.\n");
+#ifdef USE_MPI
+                MPI_Finalize();
+#endif
+                return EXIT_FAILURE;
+            }
+            // Extract local b values
+            b_values_h = (double*)malloc(nrhs * local_b_n * sizeof(double));
+            if (!b_values_h) {
+                printf("Error: host memory allocation failed\n");fflush(0);
+                return -2;
+            }
+            for (int i = 0; i < local_b_n; i++) {
+                b_values_h[i] = b_values_global[b_row_start + i];
+            }
         } else {
-            int i = 0;
-            csr_offsets_h[i++] = 0;
-            csr_offsets_h[i++] = 2;
-            csr_offsets_h[i++] = 3;
-            csr_offsets_h[i++] = 4;
-            csr_offsets_h[i++] = 5;
-
-            i = 0;
-            csr_columns_h[i++] = 0; csr_columns_h[i++] = 2;
-            csr_columns_h[i++] = 2;
-            csr_columns_h[i++] = 2;
-            csr_columns_h[i++] = 3;
-
-            i = 0;
-            csr_values_h[i++] = 4.0; csr_values_h[i++] = 1.0;
-            csr_values_h[i++] = 2.0;
-            csr_values_h[i++] = 5.0;
-            csr_values_h[i++] = 0.5;
-
-            i = 0;
-            b_values_h[i++] = 7.0;
-            b_values_h[i++] = 12.0;
-            b_values_h[i++] = 12.5;
+            /* Allocate host memory for the right-hand side b and fill with 1.0 */
+            b_values_h = (double*)malloc(nrhs * local_b_n * sizeof(double));
+            if (!b_values_h) {
+                printf("Error: host memory allocation failed\n");fflush(0);
+                return -2;
+            }
+            for (int i = 0; i < local_b_n; i++) {
+                b_values_h[i] = 1.0;
+            }
         }
 
         /* Allocate device memory for A */
@@ -374,61 +448,93 @@ int main (int argc, char *argv[]) {
         CUDA_CALL_AND_CHECK(cudaMemcpy(b_values_d, b_values_h,
             nrhs * local_b_n * sizeof(double), cudaMemcpyHostToDevice),
             "cudaMemcpy for b_values");
-    } else if (rank == 1) {
+
+        /* Send global matrix data to rank 1 if needed */
+        if (size > 1) {
+#ifdef USE_MPI
+            MPI_CALL_AND_CHECK(MPI_Send(csr_offsets_global, n + 1, MPI_INT, 1, 0, MPI_COMM_WORLD),
+                               "MPI_Send for csr_offsets_global");
+            MPI_CALL_AND_CHECK(MPI_Send(csr_columns_global, nnz, MPI_INT, 1, 1, MPI_COMM_WORLD),
+                               "MPI_Send for csr_columns_global");
+            MPI_CALL_AND_CHECK(MPI_Send(csr_values_global, nnz, MPI_DOUBLE, 1, 2, MPI_COMM_WORLD),
+                               "MPI_Send for csr_values_global");
+            if (vector_filename != nullptr && b_values_global != NULL) {
+                MPI_CALL_AND_CHECK(MPI_Send(b_values_global, n, MPI_DOUBLE, 1, 3, MPI_COMM_WORLD),
+                                   "MPI_Send for b_values_global");
+            }
+#endif
+        }
+
+        /* Free global matrix data after sending */
+        if (csr_offsets_global) free(csr_offsets_global);
+        if (csr_columns_global) free(csr_columns_global);
+        if (csr_values_global) free(csr_values_global);
+        if (b_values_global) free(b_values_global);
+    } else if (rank == 1 && size > 1) {
         //Matrix row start and end should always be 0-based
-        matrix_row_start = 1;
-        matrix_row_end   = 4;
+        // Rank 1 gets second half (with overlap from rank 0)
+        matrix_row_start = (n / 2);
+        matrix_row_end   = n - 1;
         //Note that distribution of right-hand can be different from the matrix.
-        b_row_start = 2;
-        b_row_end   = 4;
+        b_row_start = (n / 2);
+        b_row_end   = n - 1;
         int local_b_n = b_row_end - b_row_start + 1;
 
         int local_n = matrix_row_end - matrix_row_start + 1;
-        int local_nnz = 4;
+        int local_nnz = 0;
 
-        /* Allocate host memory for the sparse input matrix A and right-hand side b*/
-        csr_offsets_h = (int*)malloc((local_n + 1) * sizeof(int));
-        csr_columns_h = (int*)malloc(local_nnz * sizeof(int));
-        csr_values_h = (double*)malloc(local_nnz * sizeof(double));
+        /* Receive global matrix data from rank 0 */
+        // First, receive the global CSR arrays
+        csr_offsets_global = (int*)malloc((n + 1) * sizeof(int));
+        csr_columns_global = (int*)malloc(nnz * sizeof(int));
+        csr_values_global = (double*)malloc(nnz * sizeof(double));
+#ifdef USE_MPI
+        MPI_CALL_AND_CHECK(MPI_Recv(csr_offsets_global, n + 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE),
+                           "MPI_Recv for csr_offsets_global");
+        MPI_CALL_AND_CHECK(MPI_Recv(csr_columns_global, nnz, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE),
+                           "MPI_Recv for csr_columns_global");
+        MPI_CALL_AND_CHECK(MPI_Recv(csr_values_global, nnz, MPI_DOUBLE, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE),
+                           "MPI_Recv for csr_values_global");
+#endif
 
-        if (!csr_offsets_h || ! csr_columns_h || !csr_values_h) {
+        /* Extract local CSR data from global matrix */
+        extract_local_csr(n, csr_offsets_global, csr_columns_global, csr_values_global,
+                         matrix_row_start, matrix_row_end,
+                         &csr_offsets_h, &csr_columns_h, &csr_values_h, &local_nnz);
+
+        if (!csr_offsets_h || !csr_columns_h || !csr_values_h) {
             printf("Error: host memory allocation failed\n");fflush(0);
             return -2;
         }
 
-        /* Allocate host memory for the right-hand side b*/
-        b_values_h = (double*)malloc(nrhs * local_b_n * sizeof(double));
-        if (!b_values_h) {
-            printf("Error: host memory allocation failed\n");fflush(0);
-            return -2;
+        /* Receive or allocate right-hand side b */
+        if (vector_filename != nullptr) {
+            // Receive global b from rank 0
+            b_values_global = (double*)malloc(n * sizeof(double));
+#ifdef USE_MPI
+            MPI_CALL_AND_CHECK(MPI_Recv(b_values_global, n, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE),
+                               "MPI_Recv for b_values_global");
+#endif
+            // Extract local b values
+            b_values_h = (double*)malloc(nrhs * local_b_n * sizeof(double));
+            if (!b_values_h) {
+                printf("Error: host memory allocation failed\n");fflush(0);
+                return -2;
+            }
+            for (int i = 0; i < local_b_n; i++) {
+                b_values_h[i] = b_values_global[b_row_start + i];
+            }
+        } else {
+            /* Allocate host memory for the right-hand side b and fill with 1.0 */
+            b_values_h = (double*)malloc(nrhs * local_b_n * sizeof(double));
+            if (!b_values_h) {
+                printf("Error: host memory allocation failed\n");fflush(0);
+                return -2;
+            }
+            for (int i = 0; i < local_b_n; i++) {
+                b_values_h[i] = 1.0;
+            }
         }
-
-        /* Initialize host memory for A and b */
-        int i = 0;
-        csr_offsets_h[i++] = 0;
-        csr_offsets_h[i++] = 1;
-        csr_offsets_h[i++] = 2;
-        csr_offsets_h[i++] = 3;
-        csr_offsets_h[i++] = 4;
-
-        i = 0;
-        csr_columns_h[i++] = 1;
-        csr_columns_h[i++] = 4;
-        csr_columns_h[i++] = 3;
-        csr_columns_h[i++] = 4;
-
-        i = 0;
-        csr_values_h[i++] = 3.0;
-        csr_values_h[i++] = 1.0;
-        csr_values_h[i++] = 0.5;
-        csr_values_h[i++] = 2.0;
-
-        /* Note: Right-hand side b is initialized with values which correspond
-         * to the exact solution vector {1, 2, 3, 4, 5} */
-        i = 0;
-        b_values_h[i++] = 12.5;
-        b_values_h[i++] = 4.0;
-        b_values_h[i++] = 13.0;
 
         /* Allocate device memory for A */
         CUDA_CALL_AND_CHECK(cudaMalloc(&csr_offsets_d, (local_n + 1) * sizeof(int)),
@@ -452,6 +558,12 @@ int main (int argc, char *argv[]) {
         CUDA_CALL_AND_CHECK(cudaMemcpy(b_values_d, b_values_h,
             nrhs * local_b_n * sizeof(double), cudaMemcpyHostToDevice),
             "cudaMemcpy for b_values");
+
+        /* Free global matrix data after extraction */
+        if (csr_offsets_global) free(csr_offsets_global);
+        if (csr_columns_global) free(csr_columns_global);
+        if (csr_values_global) free(csr_values_global);
+        if (b_values_global) free(b_values_global);
     } else {
         //Ranks > 1 in this example do not have a piece of the input matrix and.
         //    right-hand side. Thus setting any pair of numbers such that
@@ -512,15 +624,25 @@ int main (int argc, char *argv[]) {
        and matrix_row_start > matrix_row_end (and it is
        fine to have NULL pointers for the data arrays). */
     cudssMatrix_t A;
-    cudssMatrixType_t mtype     = CUDSS_MTYPE_SPD;
-    cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
-    cudssIndexBase_t base       = CUDSS_BASE_ZERO;
+    cudssIndexBase_t base = CUDSS_BASE_ZERO;
+    
+    if (rank == 0) {
+        printf("--- Start solving--- \n");
+    }
+    cudaEventRecord(start);
     CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&A, nrows, ncols, nnz, csr_offsets_d,
         NULL, csr_columns_d, csr_values_d, CUDA_R_32I, CUDA_R_64F, mtype, mview,
         base), status, "cudssMatrixCreateCsr");
     /* Set row-wise 1D distribution for matrix A */
     CUDSS_CALL_AND_CHECK(cudssMatrixSetDistributionRow1d(A,
         matrix_row_start, matrix_row_end), status, "cudssMatrixSetDistributionRow1d");
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time_ms, start, stop);
+    if (rank == 0) {
+        printf("cuDSS MatrixCreateCsr time: %.4f ms\n", time_ms);
+        total_ms += time_ms;
+    }
 
     /* Setting communicator to be used by MGMN mode of cuDSS */
 #ifdef USE_MPI
@@ -541,16 +663,41 @@ int main (int argc, char *argv[]) {
 #endif
 
     /* Symbolic factorization */
+    cudaEventRecord(start);
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, solverConfig, solverData,
                          A, x, b), status, "cudssExecute for analysis");
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time_ms, start, stop);
+    if (rank == 0) {
+        printf("cuDSS Analysis time: %.4f ms\n", time_ms);
+        total_ms += time_ms;
+    }
 
     /* Factorization */
+    cudaEventRecord(start);
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_FACTORIZATION, solverConfig,
                          solverData, A, x, b), status, "cudssExecute for factor");
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time_ms, start, stop);
+    if (rank == 0) {
+        printf("cuDSS Factorization time: %.4f ms\n", time_ms);
+        total_ms += time_ms;
+    }
 
     /* Solving */
+    cudaEventRecord(start);
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_SOLVE, solverConfig, solverData,
                          A, x, b), status, "cudssExecute for solve");
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time_ms, start, stop);
+    if (rank == 0) {
+        printf("cuDSS Solve time: %.4f ms\n", time_ms);
+        total_ms += time_ms;
+        printf("cuDSS Total time: %.4f ms\n", total_ms);
+    }
 
     /* Destroying opaque objects, matrix wrappers and the cuDSS library handle */
     CUDSS_CALL_AND_CHECK(cudssMatrixDestroy(A), status, "cudssMatrixDestroy for A");
@@ -562,15 +709,26 @@ int main (int argc, char *argv[]) {
 
     CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
-    /* (optional) Print the solution and compare against the exact solution */
-    int passed = 1;
+    /* (optional) Print the solution */
     CUDA_CALL_AND_CHECK(cudaMemcpy(x_values_h, x_values_d, nrhs * n * sizeof(double),
         cudaMemcpyDeviceToHost), "cudaMemcpy for x_values");
 
-    for (int i = 0; i < n; i++) {
-        printf("RANK = %d x[%d] = %1.4f expected %1.4f\n",
-            rank, i, x_values_h[i], double(i+1));
-        if (fabs(x_values_h[i] - (i + 1)) > 2.e-15) passed = 0;
+    if (rank == 0) {
+        printf("--- Solving complete ! --- \n");
+        printf("Solution vector (first 10 and last 10 elements):\n");
+        for (int i = 0; i < n && i < 10; i++) {
+            printf("x[%d] = %e\n", i, x_values_h[i]);
+        }
+        if (n > 20) {
+            printf("...\n");
+            for (int i = n - 10; i < n; i++) {
+                printf("x[%d] = %e\n", i, x_values_h[i]);
+            }
+        } else if (n > 10) {
+            for (int i = 10; i < n; i++) {
+                printf("x[%d] = %e\n", i, x_values_h[i]);
+            }
+        }
     }
 
     /* (optional) For the root process, print the solution and compare against the exact solution */
@@ -594,7 +752,11 @@ int main (int argc, char *argv[]) {
     MPI_Finalize();
 #endif
 
-    if (status == CUDSS_STATUS_SUCCESS && passed) {
+    // Destroy CUDA events
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    if (status == CUDSS_STATUS_SUCCESS) {
         if (rank == 0)
             printf("Example PASSED\n");
         return 0;
