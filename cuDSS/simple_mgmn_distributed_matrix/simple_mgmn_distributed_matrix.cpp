@@ -158,7 +158,14 @@ void extract_local_csr(int n_global, int *csr_offsets_global, int *csr_columns_g
     }
 }
 
-
+/**
+ * 1. cmake 命令:  cmake ../ -DOPENMPI_PATH=/usr/lib/x86_64-linux-gnu/openmpi
+ * -DNCCL_PATH=/usr/lib/x86_64-linux-gnu/
+ * 2. 执行命令nccl: ./simple_mgmn_distributed_matrix_example_nccl  nccl
+ * /usr/lib/x86_64-linux-gnu/libcudss_commlayer_nccl.so  general full
+ * /home/AMGX/build/p9_100_10000.mtx
+ * 3. mpi还不对
+ */
 int main (int argc, char *argv[]) {
     cudaError_t   cuda_error = cudaSuccess;
     cudssStatus_t status     = CUDSS_STATUS_SUCCESS;
@@ -228,23 +235,27 @@ int main (int argc, char *argv[]) {
     char comm_layer_libname[1024];
     const char *matrix_filename = nullptr;
     const char *vector_filename = nullptr;
-    
-    if (argc < 3) {
-        if (rank == 0) {
-            printf("Error: this example requires at least 3 arguments:\n"
-                    "1. the communication backend name (openmpi or nccl)\n"
-                    "2. the communication layer library (full name with the path, or empty string to use CUDSS_COMM_LIB)\n"
-                    "3. the matrix filename (Matrix Market format)\n"
-                    "4. (optional) the right-hand side vector filename (Matrix Market format)\n"
-                    "Note: backend should match the communication layer library\n");
-            fflush(0);
-        }
+
+    if (argc < 6) {
+      if (rank == 0) {
+        printf("Error: this example requires at least 6 arguments:\n"
+               "1. the communication backend name (openmpi or nccl)\n"
+               "2. the communication layer library (full name with the path, "
+               "or empty string to use CUDSS_COMM_LIB)\n"
+               "3. the matrix type (general|symmetric|hermitian|spd|hpd)\n"
+               "4. the matrix view (full|lower|upper)\n"
+               "5. the matrix filename (Matrix Market format)\n"
+               "6. (optional) the right-hand side vector filename (Matrix "
+               "Market format)\n"
+               "Note: backend should match the communication layer library\n");
+        fflush(0);
+      }
 #ifdef USE_MPI
         MPI_Finalize();
 #endif
         return -2;
     }
-    
+
     strncpy(comm_backend_name, argv[1], sizeof(comm_backend_name));
     if (rank == 0) printf("Communication backend name is: %s\n", comm_backend_name);
     
@@ -257,18 +268,84 @@ int main (int argc, char *argv[]) {
                     "argument for the executable, the layer library name will be \n"
                     "taken from CUDSS_COMM_LIB environment variable\n");
     }
-    
-    matrix_filename = argv[3];
-    if (argc > 4) {
-        vector_filename = argv[4];
+
+    // Parse matrix type
+    cudssMatrixType_t mtype;
+    if (strcmp(argv[3], "general") == 0)
+      mtype = CUDSS_MTYPE_GENERAL;
+    else if (strcmp(argv[3], "symmetric") == 0)
+      mtype = CUDSS_MTYPE_SYMMETRIC;
+    else if (strcmp(argv[3], "hermitian") == 0)
+      mtype = CUDSS_MTYPE_HERMITIAN;
+    else if (strcmp(argv[3], "spd") == 0)
+      mtype = CUDSS_MTYPE_SPD;
+    else if (strcmp(argv[3], "hpd") == 0)
+      mtype = CUDSS_MTYPE_HPD;
+    else {
+      if (rank == 0) {
+        fprintf(stderr,
+                "Error: Invalid matrix type '%s'. Supported types are general, "
+                "symmetric, hermitian, spd, hpd\n",
+                argv[3]);
+      }
+#ifdef USE_MPI
+      MPI_Finalize();
+#endif
+      return EXIT_FAILURE;
+    }
+
+    // Parse matrix view
+    cudssMatrixViewType_t mview;
+    if (strcmp(argv[4], "full") == 0)
+      mview = CUDSS_MVIEW_FULL;
+    else if (strcmp(argv[4], "lower") == 0)
+      mview = CUDSS_MVIEW_LOWER;
+    else if (strcmp(argv[4], "upper") == 0)
+      mview = CUDSS_MVIEW_UPPER;
+    else {
+      if (rank == 0) {
+        fprintf(
+            stderr,
+            "Error: Invalid matrix view type '%s'. Supported types are: full, "
+            "lower, upper.\n",
+            argv[4]);
+      }
+#ifdef USE_MPI
+      MPI_Finalize();
+#endif
+      return EXIT_FAILURE;
+    }
+
+    if ((mview != CUDSS_MVIEW_FULL) && (mtype == CUDSS_MTYPE_GENERAL)) {
+      if (rank == 0) {
+        fprintf(
+            stderr,
+            "Error: you chose a lower/upper view of the matrix but you also "
+            "specified that it is general (not symmetric).\n"
+            "If your matrix file is truly non-symmetric, half of the "
+            "elements would not be used, as the lower/upper part of the\n"
+            "matrix will be mirrored and you will be solving for the wrong "
+            "matrix. Or the reader will throw an error.\n");
+      }
+#ifdef USE_MPI
+      MPI_Finalize();
+#endif
+      return EXIT_FAILURE;
+    }
+
+    matrix_filename = argv[5];
+    if (argc > 6) {
+      vector_filename = argv[6];
     }
     if (rank == 0) {
-        printf("Matrix filename: %s\n", matrix_filename);
-        if (vector_filename) {
-            printf("Vector filename: %s\n", vector_filename);
-        } else {
-            printf("No vector filename provided, will use default values\n");
-        }
+      printf("Matrix type: %s\n", argv[3]);
+      printf("Matrix view: %s\n", argv[4]);
+      printf("Matrix filename: %s\n", matrix_filename);
+      if (vector_filename) {
+        printf("Vector filename: %s\n", vector_filename);
+      } else {
+        printf("No vector filename provided, will use default values\n");
+      }
     }
     fflush(0);
 
@@ -287,6 +364,11 @@ int main (int argc, char *argv[]) {
     ncclComm_t *nccl_comm = NULL;
     if (strcmp(comm_backend_name,"nccl") == 0) {
         nccl_comm = (ncclComm_t*) malloc(sizeof(ncclComm_t));
+        if (nccl_comm == NULL) {
+          printf("Error: failed to allocate memory for nccl_comm\n");
+          fflush(0);
+          return -2;
+        }
         ncclUniqueId id;
         if (rank == 0) {
             NCCL_CALL_AND_CHECK(ncclGetUniqueId(&id), "ncclGetUniqueId");
@@ -294,6 +376,10 @@ int main (int argc, char *argv[]) {
         MPI_CALL_AND_CHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD),
                            "MPI_Bcast for id");
         NCCL_CALL_AND_CHECK(ncclCommInitRank(nccl_comm, size, id, rank), "ncclCommInitRank");
+        printf("RANK %d: NCCL communicator initialized successfully, "
+               "nccl_comm=%p\n",
+               rank, (void *)nccl_comm);
+        fflush(0);
     }
     #endif
 #endif
@@ -323,9 +409,6 @@ int main (int argc, char *argv[]) {
     int matrix_row_end   = 0;
     int b_row_start = 0;
     int b_row_end   = 0;
-
-    cudssMatrixType_t mtype = CUDSS_MTYPE_GENERAL;
-    cudssMatrixViewType_t mview = CUDSS_MVIEW_FULL;
 
     /* Read input matrix from file on rank 0 */
     if (rank == 0) {
@@ -572,6 +655,7 @@ int main (int argc, char *argv[]) {
         matrix_row_end   = 0;
         b_row_start = 1;
         b_row_end   = 0;
+        // For empty ranks, pointers can be NULL as per original example
     }
 
     /* Create a CUDA stream */
@@ -587,7 +671,8 @@ int main (int argc, char *argv[]) {
       Note: if comm_layer_libname = NULL then cudssSetCommLayer takes
       the communication layer library name from the environment variable
       "CUDSS_COMM_LIB" */
-    cudssSetCommLayer(handle, argc > 2 ? comm_layer_libname : NULL);
+    cudssSetCommLayer(
+        handle, strlen(comm_layer_libname) > 0 ? comm_layer_libname : NULL);
 
     /* (optional) Setting the custom stream for the library handle */
     CUDSS_CALL_AND_CHECK(cudssSetStream(handle, stream), status, "cudssSetStream");
@@ -648,6 +733,11 @@ int main (int argc, char *argv[]) {
 #ifdef USE_MPI
     #if USE_OPENMPI
     if (strcmp(comm_backend_name,"openmpi") == 0) {
+      if (mpi_comm == NULL) {
+        printf("RANK %d: Error: mpi_comm is NULL\n", rank);
+        fflush(0);
+        return -2;
+      }
         CUDSS_CALL_AND_CHECK(cudssDataSet(handle, solverData, CUDSS_DATA_COMM,
                                           mpi_comm, sizeof(MPI_Comm*)),
                                           status, "cudssDataSet for OpenMPI comm");
@@ -655,11 +745,24 @@ int main (int argc, char *argv[]) {
     #endif
     #if USE_NCCL
     if (strcmp(comm_backend_name,"nccl") == 0) {
-        CUDSS_CALL_AND_CHECK(cudssDataSet(handle, solverData, CUDSS_DATA_COMM,
-                             nccl_comm, sizeof(ncclComm_t*)),
-                             status, "cudssDataSet for NCCL comm");
+      if (nccl_comm == NULL) {
+        printf("RANK %d: Error: nccl_comm is NULL\n", rank);
+        fflush(0);
+        return -2;
+      }
+      printf("RANK %d: Setting NCCL communicator, nccl_comm=%p\n", rank,
+             (void *)nccl_comm);
+      fflush(0);
+      CUDSS_CALL_AND_CHECK(cudssDataSet(handle, solverData, CUDSS_DATA_COMM,
+                                        nccl_comm, sizeof(ncclComm_t *)),
+                           status, "cudssDataSet for NCCL comm");
+      printf("RANK %d: NCCL communicator set successfully\n", rank);
+      fflush(0);
     }
     #endif
+    // Synchronize all ranks before starting analysis
+    MPI_CALL_AND_CHECK(MPI_Barrier(MPI_COMM_WORLD),
+                       "MPI_Barrier before analysis");
 #endif
 
     /* Symbolic factorization */
