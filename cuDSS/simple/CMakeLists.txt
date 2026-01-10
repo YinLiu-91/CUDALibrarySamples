@@ -30,7 +30,7 @@ option(BUILD_STATIC           "Building statically linked examples" OFF)
 option(BUILD_MT_WITH_OPENMP   "Enable OpenMP backend for the MT mode examples" ON)
 
 # Find cuDSS
-find_package(cudss 0.6.0 REQUIRED)
+find_package(cudss 0.7.0 REQUIRED)
 
 # Find OpenMP
 if (BUILD_MT_WITH_OPENMP)

@@ -281,6 +281,7 @@ int run_example(const ExampleInput& input, const bool use_MT = false) {
   bool matrix_is_hermitian = false;
 
   double analysis_ms = 0.0;
+  double symbolic_fac_ms = 0.0;
   double factor_ms = 0.0;
   double solve_ms = 0.0;
   double allocation_ms = 0.0;
@@ -644,21 +645,67 @@ the threading layer library name from the environment variable
       "cudssMatrixCreateCsr");
 
   // === cuDSS 三阶段求解：分析 / 分解 / 求解，并采集耗时 ===
-  CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
-                      "cudaEventRecord (analysis start)");
-  CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, solver_config,
-                                    solver_data, A, x, b),
-                       "cudssExecute (analysis)");
-  CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream),
-                      "cudaEventRecord (analysis stop)");
-  CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop),
-                      "cudaEventSynchronize (analysis)");
-  {
-    float elapsed_ms = 0.0f;
-    CUDA_CALL_AND_CHECK(
-        cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
-        "cudaEventElapsedTime (analysis)");
-    analysis_ms = static_cast<double>(elapsed_ms);
+  bool one_ana = false;
+  if (one_ana) {
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
+                        "cudaEventRecord (analysis start)");
+    CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS,
+                                      solver_config, solver_data, A, x, b),
+                         "cudssExecute (analysis)");
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream),
+                        "cudaEventRecord (analysis stop)");
+    CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop),
+                        "cudaEventSynchronize (analysis)");
+    {
+      float elapsed_ms = 0.0f;
+      CUDA_CALL_AND_CHECK(
+          cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+          "cudaEventElapsedTime (analysis)");
+      analysis_ms = static_cast<double>(elapsed_ms);
+    }
+  } else {
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
+                        "cudaEventRecord (analysis start)");
+    CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_REORDERING,
+                                      solver_config, solver_data, A, x, b),
+                         "cudssExecute (analysis)");
+    // CUDSS_CALL_AND_CHECK(cudssExecute(handle,
+    // CUDSS_PHASE_SYMBOLIC_FACTORIZATION,
+    //                                   solver_config, solver_data, A, x, b),
+    //                      "cudssExecute (analysis)");
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream),
+                        "cudaEventRecord (analysis stop)");
+    CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop),
+                        "cudaEventSynchronize (analysis)");
+    {
+      float elapsed_ms = 0.0f;
+      CUDA_CALL_AND_CHECK(
+          cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+          "cudaEventElapsedTime (analysis)");
+      analysis_ms = static_cast<double>(elapsed_ms);
+    }
+
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
+                        "cudaEventRecord (analysis start)");
+    // CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_REORDERING,
+    //                                   solver_config, solver_data, A, x, b),
+    //                      "cudssExecute (analysis)");
+    CUDSS_CALL_AND_CHECK(cudssExecute(handle,
+                                      CUDSS_PHASE_SYMBOLIC_FACTORIZATION,
+                                      solver_config, solver_data, A, x, b),
+                         "cudssExecute (analysis)");
+    CUDA_CALL_AND_CHECK(cudaEventRecord(event_stop, stream),
+                        "cudaEventRecord (analysis stop)");
+    CUDA_CALL_AND_CHECK(cudaEventSynchronize(event_stop),
+                        "cudaEventSynchronize (analysis)");
+    {
+      float elapsed_ms = 0.0f;
+      CUDA_CALL_AND_CHECK(
+          cudaEventElapsedTime(&elapsed_ms, event_start, event_stop),
+          "cudaEventElapsedTime (analysis)");
+      symbolic_fac_ms = static_cast<double>(elapsed_ms);
+      printf("symbolic_fac_ms = %f\n", symbolic_fac_ms);
+    }
   }
   CUDA_CALL_AND_CHECK(cudaEventRecord(event_start, stream),
                       "cudaEventRecord (factor start)");
