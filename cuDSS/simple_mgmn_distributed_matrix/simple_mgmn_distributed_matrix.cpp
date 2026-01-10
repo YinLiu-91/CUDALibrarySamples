@@ -159,12 +159,15 @@ void extract_local_csr(int n_global, int *csr_offsets_global, int *csr_columns_g
 }
 
 /**
- * 1. cmake 命令:  cmake ../ -DOPENMPI_PATH=/usr/lib/x86_64-linux-gnu/openmpi
- * -DNCCL_PATH=/usr/lib/x86_64-linux-gnu/
- * 2. 执行命令nccl: ./simple_mgmn_distributed_matrix_example_nccl  nccl
- * /usr/lib/x86_64-linux-gnu/libcudss_commlayer_nccl.so  general full
+ * 0. 需要支持cuda aware的openmpi，apt-get安装的openmpi不支持cuda
+ * aware，需要单独编译
+ * 1. cmake 命令:  cmake ../ -DOPENMPI_PATH=/home/cudss/cudaa-mpi-install
+ * -DNCCL_PATH=/usr/lib/x86_64-linux-gnu
+ * 2. 执行命令openmpi: UDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --allow-run-as-root
+ * ./simple_mgmn_distributed_matrix_example_openmpi  openmpi
+ * /usr/lib/x86_64-linux-gnu/libcudss_commlayer_openmpi.so general full
  * /home/AMGX/build/p9_100_10000.mtx
- * 3. mpi还不对
+ * 3. nccl还不支持，可能由于没有nvlink？
  */
 int main (int argc, char *argv[]) {
     cudaError_t   cuda_error = cudaSuccess;
@@ -375,11 +378,8 @@ int main (int argc, char *argv[]) {
         }
         MPI_CALL_AND_CHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD),
                            "MPI_Bcast for id");
-        NCCL_CALL_AND_CHECK(ncclCommInitRank(nccl_comm, size, id, rank), "ncclCommInitRank");
-        printf("RANK %d: NCCL communicator initialized successfully, "
-               "nccl_comm=%p\n",
-               rank, (void *)nccl_comm);
-        fflush(0);
+        NCCL_CALL_AND_CHECK(ncclCommInitRank(nccl_comm, size, id, rank),
+                            "ncclCommInitRank");
     }
     #endif
 #endif
@@ -732,37 +732,24 @@ int main (int argc, char *argv[]) {
     /* Setting communicator to be used by MGMN mode of cuDSS */
 #ifdef USE_MPI
     #if USE_OPENMPI
-    if (strcmp(comm_backend_name,"openmpi") == 0) {
-      if (mpi_comm == NULL) {
-        printf("RANK %d: Error: mpi_comm is NULL\n", rank);
-        fflush(0);
-        return -2;
-      }
-        CUDSS_CALL_AND_CHECK(cudssDataSet(handle, solverData, CUDSS_DATA_COMM,
-                                          mpi_comm, sizeof(MPI_Comm*)),
-                                          status, "cudssDataSet for OpenMPI comm");
+    if (strcmp(comm_backend_name, "openmpi") == 0) {
+      CUDSS_CALL_AND_CHECK(cudssDataSet(handle, solverData, CUDSS_DATA_COMM,
+                                        mpi_comm, sizeof(MPI_Comm *)),
+                           status, "cudssDataSet for OpenMPI comm");
     }
-    #endif
-    #if USE_NCCL
+#endif
+#if USE_NCCL
     if (strcmp(comm_backend_name,"nccl") == 0) {
       if (nccl_comm == NULL) {
-        printf("RANK %d: Error: nccl_comm is NULL\n", rank);
+        printf("RANK %d: Error: nccl_comm is NULL before setting\n", rank);
         fflush(0);
         return -2;
       }
-      printf("RANK %d: Setting NCCL communicator, nccl_comm=%p\n", rank,
-             (void *)nccl_comm);
-      fflush(0);
       CUDSS_CALL_AND_CHECK(cudssDataSet(handle, solverData, CUDSS_DATA_COMM,
                                         nccl_comm, sizeof(ncclComm_t *)),
                            status, "cudssDataSet for NCCL comm");
-      printf("RANK %d: NCCL communicator set successfully\n", rank);
-      fflush(0);
     }
-    #endif
-    // Synchronize all ranks before starting analysis
-    MPI_CALL_AND_CHECK(MPI_Barrier(MPI_COMM_WORLD),
-                       "MPI_Barrier before analysis");
+#endif
 #endif
 
     /* Symbolic factorization */
