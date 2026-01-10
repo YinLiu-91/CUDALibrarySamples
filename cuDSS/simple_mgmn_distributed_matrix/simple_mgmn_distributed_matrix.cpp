@@ -756,12 +756,47 @@ int main (int argc, char *argv[]) {
     cudaEventRecord(start);
     CUDSS_CALL_AND_CHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, solverConfig, solverData,
                          A, x, b), status, "cudssExecute for analysis");
+
+    // Query CUDSS_DATA_HYBRID_DEVICE_MEMORY_MIN for current device
+    int current_device = 0;
+    cudaGetDevice(&current_device);
+    int64_t hybrid_device_memory_limit = 0;
+    size_t sizeWritten;
+    CUDSS_CALL_AND_CHECK(
+        cudssDataGet(handle, solverData, CUDSS_DATA_HYBRID_DEVICE_MEMORY_MIN,
+                     &hybrid_device_memory_limit,
+                     sizeof(hybrid_device_memory_limit), &sizeWritten),
+        status, "cudssDataGet for the memory estimates");
+    printf(
+        "RANK %d: dev_id = %d CUDSS_DATA_HYBRID_DEVICE_MEMORY_MIN %ld bytes\n",
+        rank, current_device, hybrid_device_memory_limit);
+
+    int64_t memory_estimates[16] = {0};
+    CUDSS_CALL_AND_CHECK(
+        cudssDataGet(handle, solverData, CUDSS_DATA_MEMORY_ESTIMATES,
+                     &memory_estimates, sizeof(memory_estimates), &sizeWritten),
+        status, "cudssDataGet for the memory estimates");
+    printf("RANK %d: memory estimates: device: %lf (stable) %lf (peak) MB\n",
+           rank, 1.0 * memory_estimates[0] / 1024 / 1024,
+           1.0 * memory_estimates[1] / 1024 / 1024);
+    printf("RANK %d: memory estimates: host: %lf (stable) %lf (peak) MB\n",
+           rank, 1.0 * memory_estimates[2] / 1024 / 1024,
+           1.0 * memory_estimates[3] / 1024 / 1024);
+    printf("RANK %d: memory estimates: hybrid peak: %lf MB = (GPU) %lf MB + "
+           "(CPU) %lf MB\n",
+           rank, 1.0 * memory_estimates[4] / 1024 / 1024,
+           1.0 * memory_estimates[5] / 1024 / 1024,
+           1.0 * (memory_estimates[4] - memory_estimates[5]) / 1024 / 1024);
+    fflush(0);
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time_ms, start, stop);
+    double all_3phase_time = 0.0;
     if (rank == 0) {
-        printf("cuDSS Analysis time: %.4f ms\n", time_ms);
-        total_ms += time_ms;
+      printf("cuDSS Analysis time: %.4f ms\n", time_ms);
+      total_ms += time_ms;
+      all_3phase_time += time_ms;
     }
 
     /* Factorization */
@@ -774,6 +809,7 @@ int main (int argc, char *argv[]) {
     if (rank == 0) {
         printf("cuDSS Factorization time: %.4f ms\n", time_ms);
         total_ms += time_ms;
+        all_3phase_time += time_ms;
     }
 
     /* Solving */
@@ -786,7 +822,9 @@ int main (int argc, char *argv[]) {
     if (rank == 0) {
         printf("cuDSS Solve time: %.4f ms\n", time_ms);
         total_ms += time_ms;
-        printf("cuDSS Total time: %.4f ms\n", total_ms);
+        // printf("program Total time: %.4f ms\n", total_ms);
+        all_3phase_time += time_ms;
+        printf("cuDSS Total time: %.4f ms\n", all_3phase_time);
     }
 
     /* Destroying opaque objects, matrix wrappers and the cuDSS library handle */
